@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import sys
+import json
+import time
+
+
+def format_rate(bytes_per_sec):
+  units = ['B/s', 'KB/s', 'MB/s', 'GB/s']
+  rate = bytes_per_sec
+  unit = units[0]
+  for u in units[1:]:
+    if rate < 1024:
+      break
+    rate /= 1024
+    unit = u
+  return f'{rate:.2f} {unit}'
+
+
+def get_state_path(logfile):
+  safe_name = logfile.replace('/', '_').lstrip('_')
+  return f'/var/tmp/nagios_log_rate_state_{safe_name}.json'
+
+
+def read_state(state_path):
+  try:
+    with open(state_path, 'r') as f:
+      return json.load(f)
+  except Exception:
+    return None
+
+
+def write_state(state_path, inode, size, timestamp):
+  with open(state_path, 'w') as f:
+    json.dump({
+      'timestamp': timestamp,
+      'size': size,
+      'inode': inode,
+    }, f)
+
+
+def usage_error(msg):
+  print(f'UNKNOWN - {msg}')
+  sys.exit(3)
+
+
+parser = argparse.ArgumentParser(
+  description='Check log growth rate and alert if above threshold')
+parser.add_argument('logfile', help='Path to the logfile to monitor')
+parser.add_argument('-w', '--warning', type=int, required=True,
+                    help='Warning threshold in KB/min')
+parser.add_argument('-c', '--critical', type=int, required=True,
+                    help='Critical threshold in KB/min')
+
+args = parser.parse_args()
+logfile = args.logfile
+warn_thresh = args.warning
+crit_thresh = args.critical
+
+if not os.path.isfile(logfile):
+  usage_error(f'UNKNOWN - Log file not found: {logfile}')
+
+now = int(time.time())
+try:
+  stat = os.stat(logfile)
+  curr_size = stat.st_size
+  curr_inode = stat.st_ino
+except Exception as e:
+  usage_error(f'Failed to stat file: {e}')
+
+state_path = get_state_path(logfile)
+state = read_state(state_path)
+
+if not state:
+  write_state(state_path, curr_inode, curr_size, now)
+  print('OK - Initialized state file')
+  sys.exit(0)
+
+if state['inode'] != curr_inode:
+  write_state(state_path, curr_inode, curr_size, now)
+  print('OK - Detected log rotation. Reset state.')
+  sys.exit(0)
+
+if curr_size < state['size']:
+  write_state(state_path, curr_inode, curr_size, now)
+  print('OK - Detected log truncation. Reset state.')
+  sys.exit(0)
+
+delta_time = now - state['timestamp']
+delta_size = curr_size - state['size']
+
+if delta_time <= 0:
+  usage_error(f'Invalid time delta: {delta_time} seconds')
+
+bytes_per_sec = delta_size / delta_time
+bytes_per_min = delta_size * 60 / delta_time
+rate_kb_per_min = int(bytes_per_min / 1024)
+
+rate_sec_fmt = format_rate(bytes_per_sec)
+rate_min_fmt = format_rate(bytes_per_min)
+
+since_str = f'{delta_time} seconds'
+
+if rate_kb_per_min >= crit_thresh:
+  status = 'CRITICAL'
+  exit_code = 2
+elif rate_kb_per_min >= warn_thresh:
+  status = 'WARNING'
+  exit_code = 1
+else:
+  status = 'OK'
+  exit_code = 0
+
+print(
+  f'{status} - {logfile} grew {delta_size} bytes in {since_str} | '
+  f'Rate: {rate_sec_fmt} ({rate_min_fmt} per minute), '
+  f'{rate_kb_per_min} KB/min | Threshold (KB/min): warn: {warn_thresh}, '
+  f'crit: {crit_thresh}'
+)
+
+write_state(state_path, curr_inode, curr_size, now)
+sys.exit(exit_code)
