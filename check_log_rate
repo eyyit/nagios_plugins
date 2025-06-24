@@ -7,16 +7,29 @@ import json
 import time
 
 
-def format_rate(bytes_per_sec):
-  units = ['B/s', 'KB/s', 'MB/s', 'GB/s']
-  rate = bytes_per_sec
+EXIT_STATUSES = {
+    0: 'OK',
+    1: 'WARNING',
+    2: 'CRITICAL',
+    3: 'UNKNOWN',
+}
+MIN_REQUIRED_DELTA = 60 * 60  # 1 Hour.
+
+
+def do_exit(code, msg):
+  print(f'{EXIT_STATUSES[code]} - {msg}')
+  sys.exit(code)
+
+
+def format_size(size):
+  units = ['B', 'KB', 'MB', 'GB']
   unit = units[0]
   for u in units[1:]:
-    if rate < 1024:
+    if size < 1024:
       break
-    rate /= 1024
+    size /= 1024
     unit = u
-  return f'{rate:.2f} {unit}'
+  return f'{size:.2f} {unit}'
 
 
 def get_state_path(logfile):
@@ -24,31 +37,53 @@ def get_state_path(logfile):
   return f'/var/tmp/nagios_log_rate_state_{safe_name}.json'
 
 
-def read_state(state_path):
+def get_state(logfile, min_age):
+  statefile = get_state_path(logfile)
+  timestamp = int(time.time())
+  valid_samples = []
+  samples = read_state(logfile, statefile)
+  newest = stat_file(logfile)
+  newest.update({'timestamp': timestamp})
+  samples.append(newest)
+
+  # Validate samples.
+  for sample in samples:
+    if all(x in sample for x in ['inode', 'size', 'timestamp']):
+      # Remove samples older than age window
+      if timestamp - sample['timestamp'] <= min_age:
+        valid_samples.append(sample)
+  valid_samples.sort(key=lambda sample: sample['timestamp'])
+
+  with open(statefile, 'w') as f:
+    json.dump(valid_samples, f)
+  return valid_samples
+
+
+def read_state(logfile, statefile):
   try:
-    with open(state_path, 'r') as f:
-      return json.load(f)
+    with open(statefile, 'r') as f:
+      state = json.load(f)
   except Exception:
-    return None
+    return []
+  if not isinstance(state, list):
+    return []
+  return state
 
 
-def write_state(state_path, inode, size, timestamp):
-  with open(state_path, 'w') as f:
-    json.dump({
-      'timestamp': timestamp,
-      'size': size,
-      'inode': inode,
-    }, f)
-
-
-def usage_error(msg):
-  print(f'UNKNOWN - {msg}')
-  sys.exit(3)
+def stat_file(filename):
+  try:
+    stat = os.stat(filename)
+  except Exception as error:
+    do_exit(3, f'Failed to stat file: {error}')
+  return {'inode': stat.st_ino, 'size': stat.st_size}
 
 
 parser = argparse.ArgumentParser(
-  description='Check log growth rate and alert if above threshold')
+  description='Check log growth rate per hour and alert if above threshold')
 parser.add_argument('logfile', help='Path to the logfile to monitor')
+parser.add_argument('-m', '--min-age', type=int, default=MIN_REQUIRED_DELTA,
+                    help=('Minimum age of state data in seconds before '
+                          f'evaluation (default: {MIN_REQUIRED_DELTA})'))
 parser.add_argument('-w', '--warning', type=int, required=True,
                     help='Warning threshold in KB/min')
 parser.add_argument('-c', '--critical', type=int, required=True,
@@ -56,69 +91,53 @@ parser.add_argument('-c', '--critical', type=int, required=True,
 
 args = parser.parse_args()
 logfile = args.logfile
+min_age = args.min_age
 warn_thresh = args.warning
 crit_thresh = args.critical
 
 if not os.path.isfile(logfile):
-  usage_error(f'UNKNOWN - Log file not found: {logfile}')
+  do_exit(3, f'Log file not found: {logfile}')
 
-now = int(time.time())
-try:
-  stat = os.stat(logfile)
-  curr_size = stat.st_size
-  curr_inode = stat.st_ino
-except Exception as e:
-  usage_error(f'Failed to stat file: {e}')
+samples = get_state(logfile, min_age)
 
-state_path = get_state_path(logfile)
-state = read_state(state_path)
+if len(samples) < 2:
+  do_exit(0, 'Waiting for more data (initializing sample history)')
 
-if not state:
-  write_state(state_path, curr_inode, curr_size, now)
-  print('OK - Initialized state file')
-  sys.exit(0)
+oldest = samples[0]
+newest = samples[-1]
 
-if state['inode'] != curr_inode:
-  write_state(state_path, curr_inode, curr_size, now)
-  print('OK - Detected log rotation. Reset state.')
-  sys.exit(0)
+delta_size = newest['size'] - oldest['size']
+delta_time = newest['timestamp'] - oldest['timestamp']
 
-if curr_size < state['size']:
-  write_state(state_path, curr_inode, curr_size, now)
-  print('OK - Detected log truncation. Reset state.')
-  sys.exit(0)
-
-delta_time = now - state['timestamp']
-delta_size = curr_size - state['size']
-
+if newest['inode'] != oldest['inode']:
+  do_exit(0, 'Detected log rotation. Reset state.')
+if delta_size < 0:
+  do_exit(0, 'Detected log truncation. Reset state.')
 if delta_time <= 0:
-  usage_error(f'Invalid time delta: {delta_time} seconds')
+  do_exit(3, f'Invalid time delta: {delta_time} seconds')
+if delta_time < min_age:
+  minutes = delta_time // 60
+  required = min_age // 60
+  do_exit(0, (f'Waiting for more data ({minutes} minutes collected, need '
+              f'{required}) before evaluating log growth rate.'))
 
 bytes_per_sec = delta_size / delta_time
 bytes_per_min = delta_size * 60 / delta_time
 rate_kb_per_min = int(bytes_per_min / 1024)
 
-rate_sec_fmt = format_rate(bytes_per_sec)
-rate_min_fmt = format_rate(bytes_per_min)
-
-since_str = f'{delta_time} seconds'
-
 if rate_kb_per_min >= crit_thresh:
-  status = 'CRITICAL'
   exit_code = 2
 elif rate_kb_per_min >= warn_thresh:
-  status = 'WARNING'
   exit_code = 1
 else:
-  status = 'OK'
   exit_code = 0
 
-print(
-  f'{status} - {logfile} grew {delta_size} bytes in {since_str} | '
-  f'Rate: {rate_sec_fmt} ({rate_min_fmt} per minute), '
-  f'{rate_kb_per_min} KB/min | Threshold (KB/min): warn: {warn_thresh}, '
-  f'crit: {crit_thresh}'
-)
+rate_sec_fmt = format_size(bytes_per_sec) + '/s'
+rate_min_fmt = format_size(bytes_per_min) + '/min'
+since_str = f'{delta_time} seconds'
 
-write_state(state_path, curr_inode, curr_size, now)
-sys.exit(exit_code)
+do_exit(exit_code, (
+  f'{logfile} grew {delta_size} bytes ({format_size(delta_size)}) in '
+  f'{since_str} | Rate: {rate_sec_fmt} ({rate_min_fmt}) | Thresholds (KB/min): '
+  f'warn: {warn_thresh}, crit: {crit_thresh}'
+))
