@@ -49,8 +49,8 @@ def get_state(logfile, min_age):
   # Validate samples.
   for sample in samples:
     if all(x in sample for x in ['inode', 'size', 'timestamp']):
-      # Remove samples older than age window
-      if timestamp - sample['timestamp'] <= min_age:
+      # Remove samples older than age window plus some wiggle room.
+      if timestamp - sample['timestamp'] <= min_age * 2:
         valid_samples.append(sample)
   valid_samples.sort(key=lambda sample: sample['timestamp'])
 
@@ -137,7 +137,7 @@ rate_min_fmt = format_size(bytes_per_min) + '/min'
 since_str = f'{delta_time} seconds'
 
 do_exit(exit_code, (
-  f'{logfile} grew {delta_size} bytes ({format_size(delta_size)}) in '
-  f'{since_str} | Rate: {rate_sec_fmt} ({rate_min_fmt}) | Thresholds (KB/min): '
-  f'warn: {warn_thresh}, crit: {crit_thresh}'
+  f'{logfile} grew {format_size(delta_size)} in {since_str}'
+  f' -- Rate: {rate_sec_fmt} ({rate_min_fmt})'
+  f' -- Thresholds (KB/min): warn: {warn_thresh}, crit: {crit_thresh}'
 ))
