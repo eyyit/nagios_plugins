@@ -1,0 +1,46 @@
+#!/bin/bash
+
+OK=0
+WARNING=1
+CRITICAL=2
+UNKNOWN=3
+
+usage() {
+  echo "Usage: $0 -f <file_path> -w <warning_minutes> -c <critical_minutes>"
+  exit $UNKNOWN
+}
+
+while getopts "f:w:c:" opt; do
+  case $opt in
+    f) FILE=$OPTARG ;;
+    w) WARN=$OPTARG ;;
+    c) CRIT=$OPTARG ;;
+    *) usage ;;
+  esac
+done
+
+if [[ -z "$FILE" || -z "$WARN" || -z "$CRIT" ]]; then
+  usage
+fi
+
+if [[ ! -f "$FILE" ]]; then
+  echo "CRITICAL: File $FILE does not exist."
+  exit $CRITICAL
+fi
+
+# Calculate file age in minutes
+CURRENT_TIME=$(date +%s)
+FILE_TIME=$(stat -c %Y "$FILE")
+AGE_SECONDS=$((CURRENT_TIME - FILE_TIME))
+AGE_MINUTES=$((AGE_SECONDS / 60))
+
+# Threshold Comparison
+if [ "$AGE_MINUTES" -ge "$CRIT" ]; then
+  echo "CRITICAL: $FILE age is $AGE_MINUTES minutes (Threshold: $CRIT)."
+  exit $CRITICAL
+elif [ "$AGE_MINUTES" -ge "$WARN" ]; then
+  echo "WARNING: $FILE age is $AGE_MINUTES minutes (Threshold: $WARN)."
+  exit $WARNING
+fi
+echo "OK: $FILE age is $AGE_MINUTES minutes."
+exit $OK
