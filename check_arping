@@ -1,0 +1,16 @@
+#!/bin/bash -x
+# Usage: ./check_arping.sh [IP|hostname] [Interface]
+
+HOST="$1"
+INTERFACE="${2:-eth0}"
+
+reply=$(/usr/bin/sudo /usr/sbin/arping -c 2 -w 2 -I $INTERFACE $HOST 2>&1)
+EXITCODE=$?
+
+if [ $EXITCODE -ne 0 ]; then
+  echo "CRITICAL - No ARP Reply from $1 | $(echo $reply | tr '\n' ' ')"
+  exit 2
+fi
+
+echo "OK - ARP Reply received | $(echo $reply | tr '\n' ' ')"
+exit 0
