@@ -1,74 +1,85 @@
 #!/usr/bin/python3
 
-import optparse
+import argparse
+import pathlib
 import sys
 
+
+RETURN_VALUES = ('OK', 'WARNING', 'CRITICAL', 'UNKNOWN')
+
+
+class NagiosArgumentParser(argparse.ArgumentParser):
+
+  def __init__(self, label, *args, **kwargs):
+    self.label = label
+    super().__init__(*args, **kwargs)
+
+  def error(self, message):
+    print(f'{self.label} UNKNOWN: {message}')
+    raise SystemExit(3)
 
 
 def get_status(value, warn, crit):
   if value >= crit:
     return 2
-  elif value >= warn:
+  if value >= warn:
     return 1
   return 0
 
 
-def get_meminfo(mode):
-  total = -1
-  avail = -1
-  if mode == 'MEMORY':
-    keys = ['MemTotal', 'MemAvailable']
-  elif mode == 'SWAP':
-    keys = ['SwapTotal', 'SwapFree']
-  with open('/proc/meminfo') as f:
-    for line in f.read().splitlines():
-      for k in keys:
-        if line.startswith(f'{k}:'):
-          val = int(line.split()[1]) >> 10
-          if 'total' in k.lower():
-            total = val
-          else:
-            avail = val
-          keys.remove(k)
-          break
-      if all([v != -1 for v in [total, avail]]):
-        break
-  return (total, avail)
+def get_meminfo(mode, path='/proc/meminfo'):
+  names = {
+      'MEMORY': ('MemTotal', 'MemAvailable'),
+      'SWAP': ('SwapTotal', 'SwapFree'),
+  }
+  total_key, available_key = names[mode]
+  values = {}
+  with open(path, encoding='utf-8') as meminfo:
+    for line in meminfo:
+      key, separator, raw_value = line.partition(':')
+      if separator and key in (total_key, available_key):
+        fields = raw_value.split()
+        if not fields:
+          raise ValueError(f'{key} has no value')
+        values[key] = int(fields[0]) // 1024
+  if total_key not in values or available_key not in values:
+    raise ValueError(f'{total_key} or {available_key} missing from {path}')
+  return values[total_key], values[available_key]
 
 
-def check_avail(mode, warn, crit):
-  RETURN_VALUES = ['OK', 'WARNING', 'CRITICAL', 'UNKNOWN']
-  total, avail = get_meminfo(mode)
-  used = total - avail
-  pct = 100 - int(round(avail / total * 100, 0))
-  status = get_status(pct, warn, crit)
-  msg = (f'{mode} {RETURN_VALUES[status]}: {pct}% used '
-         f'({used} MB out of {total} MB)')
-  return (status, msg)
+def check_avail(mode, warn, crit, path='/proc/meminfo'):
+  total, available = get_meminfo(mode, path)
+  if total == 0 and mode == 'SWAP':
+    return 0, 'SWAP OK: Swap is not configured (0 MB total)'
+  if total <= 0 or not 0 <= available <= total:
+    raise ValueError(
+        f'Invalid {mode.lower()} values: total={total}, available={available}')
+  used = total - available
+  percent_used = round(used / total * 100)
+  status = get_status(percent_used, warn, crit)
+  message = (f'{mode} {RETURN_VALUES[status]}: {percent_used}% used '
+             f'({used} MB out of {total} MB)')
+  return status, message
 
 
 def main():
-  if 'swap' in __file__.lower():
-    mode = 'SWAP'
-  else:
-    mode = 'MEMORY'
-  parser = optparse.OptionParser()
-  parser.add_option('--warn', type='int', help='% free warning threshold')
-  parser.add_option('--crit', type='int', help='% free critical threshold')
-  (args, _) = parser.parse_args()
-  error = ''
-  if args.crit and args.warn and args.crit <= args.warn:
-    error = '--warn percentage should be more than --crit percentage.'
-  if not (args.crit and args.warn):
-    error = 'Provide both args: --warn and --crit'
-  if error:
-    parser.print_help()
-    parser.error(error)
+  mode = 'SWAP' if 'swap' in pathlib.Path(__file__).name.lower() else 'MEMORY'
+  parser = NagiosArgumentParser(mode)
+  parser.add_argument('--warn', type=int, required=True,
+                      help='Used percentage warning threshold.')
+  parser.add_argument('--crit', type=int, required=True,
+                      help='Used percentage critical threshold.')
+  args = parser.parse_args()
 
-  return check_avail(mode, args.warn, args.crit)
+  if not 0 <= args.warn < args.crit <= 100:
+    parser.error('Thresholds must satisfy 0 <= warn < crit <= 100.')
+  try:
+    return check_avail(mode, args.warn, args.crit)
+  except (OSError, ValueError) as error:
+    return 3, f'{mode} UNKNOWN: {error}'
 
 
 if __name__ == '__main__':
-  (status, msg) = main()
-  print(msg)
+  status, message = main()
+  print(message)
   sys.exit(status)

@@ -1,0 +1,312 @@
+#!/usr/bin/python3
+
+import contextlib
+import io
+import pathlib
+import sys
+import types
+import unittest
+from unittest import mock
+
+
+PLUGIN_PATH = pathlib.Path(__file__).with_name('check_brother_printer')
+HTML = '''
+<dt>Drum&#32;Unit*</dt>
+<dd>{drum}%</dd>
+<dt>Toner**</dt>
+<dd>{toner}%</dd>
+<dt>Page&#32;Counter</dt><dd>1234</dd>
+'''
+
+
+def load_plugin():
+  module = types.ModuleType('check_brother_printer')
+  module.__file__ = str(PLUGIN_PATH)
+  exec(compile(PLUGIN_PATH.read_bytes(), str(PLUGIN_PATH), 'exec'),
+       module.__dict__)
+  return module
+
+
+class BrotherPrinterTest(unittest.TestCase):
+
+  def setUp(self):
+    self.plugin = load_plugin()
+    self.response = mock.Mock()
+    self.response.text = HTML.format(drum=75, toner=50)
+    self.response.raise_for_status.return_value = None
+
+  def run_plugin(self, *extra_args):
+    args = [
+        'check_brother_printer', 'printer.example.com',
+        '--drum-warn', '20', '--drum-crit', '10',
+        '--toner-warn', '20', '--toner-crit', '10',
+    ]
+    args.extend(extra_args)
+    output = io.StringIO()
+    self.wake = mock.Mock()
+    self.sleep = mock.Mock()
+    with mock.patch.object(sys, 'argv', args), \
+         mock.patch.object(self.plugin.requests, 'get',
+                           return_value=self.response) as request, \
+         mock.patch.object(self.plugin, 'wake_printer', self.wake), \
+         mock.patch.object(self.plugin.time, 'sleep', self.sleep), \
+         contextlib.redirect_stdout(output):
+      status = self.plugin.main()
+    return status, output.getvalue().strip(), request
+
+  def test_ok(self):
+    status, output, request = self.run_plugin('--timeout', '2.5')
+
+    self.assertEqual(0, status)
+    self.assertEqual(
+        'OK: Drum: 75%, Toner: 50%, Page counter: 1234.', output)
+    request.assert_called_once_with(
+        'http://printer.example.com/general/information.html', timeout=2.5)
+    self.response.raise_for_status.assert_called_once_with()
+    self.wake.assert_not_called()
+    self.sleep.assert_not_called()
+
+  def test_warning(self):
+    self.response.text = HTML.format(drum=15, toner=50)
+
+    status, output, _ = self.run_plugin()
+
+    self.assertEqual(1, status)
+    self.assertTrue(output.startswith('WARNING:'))
+
+  def test_critical_takes_precedence(self):
+    self.response.text = HTML.format(drum=15, toner=5)
+
+    status, output, _ = self.run_plugin()
+
+    self.assertEqual(2, status)
+    self.assertTrue(output.startswith('CRITICAL:'))
+
+  def test_connection_error_wakes_waits_and_retries(self):
+    error = self.plugin.requests.ConnectionError('No route to host')
+    output = io.StringIO()
+    args = [
+        'check_brother_printer', 'printer.example.com',
+        '--drum-warn', '20', '--drum-crit', '10',
+        '--toner-warn', '20', '--toner-crit', '10',
+    ]
+    wake = mock.Mock()
+    sleep = mock.Mock()
+    with mock.patch.object(sys, 'argv', args), \
+         mock.patch.object(self.plugin.requests, 'get',
+                           side_effect=[error, self.response]) as request, \
+         mock.patch.object(self.plugin, 'wake_printer', wake), \
+         mock.patch.object(self.plugin.time, 'sleep', sleep), \
+         contextlib.redirect_stdout(output):
+      status = self.plugin.main()
+
+    self.assertEqual(0, status)
+    self.assertEqual(
+        'OK: Drum: 75%, Toner: 50%, Page counter: 1234.',
+        output.getvalue().strip())
+    self.assertEqual(2, request.call_count)
+    wake.assert_called_once_with('printer.example.com', 9100, 8)
+    sleep.assert_called_once_with(10)
+    self.assertNotIn('Traceback', output.getvalue())
+
+  def test_http_error_wakes_and_retries(self):
+    self.response.raise_for_status.side_effect = \
+        [self.plugin.requests.HTTPError('503 Server Error'), None]
+
+    status, output, _ = self.run_plugin()
+
+    self.assertEqual(0, status)
+    self.assertTrue(output.startswith('OK:'))
+    self.wake.assert_called_once_with('printer.example.com', 9100, 8)
+    self.sleep.assert_called_once_with(10)
+
+  def test_wake_job_is_zero_page_pjl_pcl_job(self):
+    expected_job = (
+        b'\x1b%-12345X'
+        b'@PJL JOB NAME="NAGIOS WAKE CHECK"\r\n'
+        b'@PJL USTATUS JOB=ON\r\n'
+        b'@PJL ENTER LANGUAGE=PCL\r\n'
+        b'\x1bE'
+        b'\x1b%-12345X'
+        b'@PJL EOJ NAME="NAGIOS WAKE CHECK"\r\n'
+        b'\x1b%-12345X'
+    )
+    connection = mock.MagicMock()
+    context = mock.MagicMock()
+    context.__enter__.return_value = connection
+    context.__exit__.return_value = None
+
+    with mock.patch.object(self.plugin.socket, 'create_connection',
+                           return_value=context) as create_connection:
+      self.plugin.wake_printer('printer.example.com', 19100, 2.5)
+
+    create_connection.assert_called_once_with(
+        ('printer.example.com', 19100), timeout=2.5)
+    self.assertEqual(expected_job, self.plugin.WAKE_JOB)
+    connection.sendall.assert_called_once_with(expected_job)
+    connection.shutdown.assert_called_once_with(self.plugin.socket.SHUT_WR)
+    self.assertIn(b'@PJL ENTER LANGUAGE=PCL\r\n', self.plugin.WAKE_JOB)
+    self.assertIn(b'\x1bE', self.plugin.WAKE_JOB)
+    self.assertNotIn(b'\x0c', self.plugin.WAKE_JOB)
+
+  def test_failed_wake_still_waits_and_retries_http(self):
+    error = self.plugin.requests.ConnectionError('HTTP asleep')
+    output = io.StringIO()
+    args = [
+        'check_brother_printer', 'printer.example.com',
+        '--drum-warn', '20', '--drum-crit', '10',
+        '--toner-warn', '20', '--toner-crit', '10',
+        '--wake-delay', '3.5',
+    ]
+    with mock.patch.object(sys, 'argv', args), \
+         mock.patch.object(self.plugin.requests, 'get',
+                           side_effect=[error, self.response]) as request, \
+         mock.patch.object(self.plugin, 'wake_printer',
+                           side_effect=OSError('reset by peer')) as wake, \
+         mock.patch.object(self.plugin.time, 'sleep') as sleep, \
+         contextlib.redirect_stdout(output):
+      status = self.plugin.main()
+
+    self.assertEqual(0, status)
+    self.assertEqual(2, request.call_count)
+    wake.assert_called_once_with('printer.example.com', 9100, 8)
+    sleep.assert_called_once_with(3.5)
+
+  def test_two_http_failures_are_unknown_with_wake_context(self):
+    first = self.plugin.requests.ConnectionError('first timeout')
+    second = self.plugin.requests.ConnectionError('second timeout')
+    output = io.StringIO()
+    args = [
+        'check_brother_printer', 'printer.example.com',
+        '--drum-warn', '20', '--drum-crit', '10',
+        '--toner-warn', '20', '--toner-crit', '10',
+    ]
+    with mock.patch.object(sys, 'argv', args), \
+         mock.patch.object(self.plugin.requests, 'get',
+                           side_effect=[first, second]), \
+         mock.patch.object(self.plugin, 'wake_printer',
+                           side_effect=OSError('port unavailable')), \
+         mock.patch.object(self.plugin.time, 'sleep'), \
+         contextlib.redirect_stdout(output):
+      status = self.plugin.main()
+
+    self.assertEqual(3, status)
+    self.assertIn('initial query failed: first timeout', output.getvalue())
+    self.assertIn('wake failed: port unavailable', output.getvalue())
+    self.assertIn('retry failed: second timeout', output.getvalue())
+
+  def test_unexpected_html_is_unknown(self):
+    self.response.text = '<html>printer login page</html>'
+
+    status, output, _ = self.run_plugin()
+
+    self.assertEqual(3, status)
+    self.assertIn('UNKNOWN: Unable to parse', output)
+    self.assertIn('drum value was not found', output)
+    self.wake.assert_not_called()
+    self.sleep.assert_not_called()
+
+  def test_missing_drum_value_does_not_capture_toner_value(self):
+    self.response.text = '''
+<dt>Drum&#32;Unit*</dt>
+<dt>Toner**</dt><dd>50%</dd>
+<dt>Page&#32;Counter</dt><dd>1234</dd>
+'''
+
+    status, output, _ = self.run_plugin()
+
+    self.assertEqual(3, status)
+    self.assertIn('drum value was not found', output)
+
+  def test_reversed_thresholds_are_unknown(self):
+    args = [
+        'check_brother_printer', 'printer.example.com',
+        '--drum-warn', '10', '--drum-crit', '20',
+        '--toner-warn', '20', '--toner-crit', '10',
+    ]
+    output = io.StringIO()
+    with mock.patch.object(sys, 'argv', args), \
+         contextlib.redirect_stdout(output), \
+         self.assertRaisesRegex(SystemExit, '3'):
+      self.plugin.main()
+
+    self.assertEqual(
+        'UNKNOWN: Drum critical threshold must not exceed warning threshold.',
+        output.getvalue().strip())
+
+  def test_invalid_threshold_type_is_unknown(self):
+    args = [
+        'check_brother_printer', 'printer.example.com',
+        '--drum-warn', 'invalid', '--drum-crit', '10',
+        '--toner-warn', '20', '--toner-crit', '10',
+    ]
+    output = io.StringIO()
+    with mock.patch.object(sys, 'argv', args), \
+         contextlib.redirect_stdout(output), \
+         self.assertRaisesRegex(SystemExit, '3'):
+      self.plugin.main()
+
+    self.assertIn('UNKNOWN: argument --drum-warn:', output.getvalue())
+
+  def test_nonfinite_timeout_is_unknown_without_request(self):
+    output = io.StringIO()
+    args = [
+        'check_brother_printer', 'printer.example.com',
+        '--drum-warn', '20', '--drum-crit', '10',
+        '--toner-warn', '20', '--toner-crit', '10',
+        '--timeout', 'nan',
+    ]
+    with mock.patch.object(sys, 'argv', args), \
+         mock.patch.object(self.plugin.requests, 'get') as request, \
+         contextlib.redirect_stdout(output), \
+         self.assertRaisesRegex(SystemExit, '3'):
+      self.plugin.main()
+
+    request.assert_not_called()
+    self.assertEqual(
+        'UNKNOWN: Timeout must be a finite number greater than zero.',
+        output.getvalue().strip())
+
+  def test_invalid_wake_settings_are_unknown_without_request(self):
+    invalid_options = [
+        ('--wake-port', '0', 'Wake port must be between 1 and 65535.'),
+        ('--wake-port', '65536', 'Wake port must be between 1 and 65535.'),
+        ('--wake-timeout', 'nan',
+         'Wake timeout must be a finite number greater than zero.'),
+        ('--wake-timeout', '0',
+         'Wake timeout must be a finite number greater than zero.'),
+        ('--wake-delay', '-1',
+         'Wake delay must be a finite number greater than or equal to zero.'),
+        ('--wake-delay', 'inf',
+         'Wake delay must be a finite number greater than or equal to zero.'),
+    ]
+    for option, value, message in invalid_options:
+      with self.subTest(option=option, value=value):
+        output = io.StringIO()
+        args = [
+            'check_brother_printer', 'printer.example.com',
+            '--drum-warn', '20', '--drum-crit', '10',
+            '--toner-warn', '20', '--toner-crit', '10',
+            option, value,
+        ]
+        with mock.patch.object(sys, 'argv', args), \
+             mock.patch.object(self.plugin.requests, 'get') as request, \
+             contextlib.redirect_stdout(output), \
+             self.assertRaisesRegex(SystemExit, '3'):
+          self.plugin.main()
+
+        request.assert_not_called()
+        self.assertEqual(f'UNKNOWN: {message}', output.getvalue().strip())
+
+  def test_out_of_range_supply_percentage_is_unknown(self):
+    self.response.text = HTML.format(drum=999, toner=50)
+
+    status, output, _ = self.run_plugin()
+
+    self.assertEqual(3, status)
+    self.assertIn('UNKNOWN: Unable to parse', output)
+    self.assertIn('supply percentages must be between 0 and 100', output)
+
+
+if __name__ == '__main__':
+  unittest.main()

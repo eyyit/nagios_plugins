@@ -1,92 +1,65 @@
 #!/bin/bash
-#Auteur : David KULAK
-#Source : github.com/davidkulak/check_docker
 
-function fHelp
-{
-  echo "usage: check_docker [-h] [-H SOCKET] [-c CONTAINER]"
-  echo ""
-  echo "optional arguments:"
-  echo "   -h            show this help message and exit"
-  echo "   -H SOCKET     socket location for docker engine"
-  echo "   -c CONTAINER  container NAME or ID"
-  exit 0;
-}
+DOCKER='/usr/bin/docker'
+FMT_IP='{{ .NetworkSettings.IPAddress }}'
+FMT_NETWORK='{{range .NetworkSettings.Networks}}{{.IPAddress}},{{end}}'
+FMT_HEALTH='{{ .State.Health.Status }}'
+FMT_RUNNING='{{ .State.Running }}'
+FMT_STARTED='{{ .State.StartedAt }}'
+INSPECT="$DOCKER inspect"
 
-function fCountContainers {
-  nbContainers=$(/usr/bin/docker -H $HOST ps -q | wc -l)
-}
+CONTAINER="$1"
 
-function fCountImages {
-  nbImages=$(/usr/bin/docker -H $HOST images -q | wc -l)
-}
-
-#INIT
-
-OPTHOST=0
-OPTCONT=0
-
-#PARAM
-
-while getopts c:H:h option
-do
- case $option in
-  H) OPTHOST=1
-   ARGHOST=${OPTARG} ;;
-  c) OPTCONT=1
-   ARGCONT=${OPTARG} ;;
-  h) fHelp ;;
-  *) fHelp ;;
- esac
-done
-
-if [[ $OPTHOST -eq 0 ]]; then
-  HOST="unix:///var/run/docker.sock"
-else
-  HOST=$ARGHOST
-fi
-
-/usr/bin/docker -H $HOST ps > /dev/null 2>&1
-
-if [ $? -eq 0 ]; then
-  fCountContainers
-  fCountImages
-  if [[ $OPTCONT -ne 0 ]]; then
-    CONTAINER=$ARGCONT
-    CONTAINER_U=$(echo $CONTAINER | tr [:lower:] [:upper:])
-    RUNNING=$(/usr/bin/docker -H $HOST inspect --format="{{ .State.Running }}" $CONTAINER 2> /dev/null)
-    if [ $? -eq 1 ]; then
-      echo "$CONTAINER_U CRITICAL: Container does not exist."
-      exit 2
-    fi
-    if [ "$RUNNING" == "false" ]; then
-      echo "$CONTAINER_U WARNING: Container is not running."
-      exit 1
-    fi
-    HEALTH=$(/usr/bin/docker -H $HOST inspect --format="{{ .State.Health.Status }}" $CONTAINER 2> /dev/null)
-    if [ -z "$HEALTH" ]; then
-      HEALTH="healthchecks are not implemented"
-    elif [ "$HEALTH" != "healthy" ]; then
-      echo "$CONTAINER_U WARNING: Container is $HEALTH."
-      exit 1
-    fi
-    STARTED=$(date --date="$(/usr/bin/docker -H $HOST inspect --format="{{ .State.StartedAt }}" $CONTAINER)")
-    started_epoch=$(date --date="$STARTED" +%s)
-    now=$(date +%s)
-    if [[ "$started_epoch" -gt $((now-60)) ]]; then
-      echo "$CONTAINER_U WARNING: Container just restarted at $(date --date="$STARTED")"
-      exit 1
-    fi
-    NETWORK=$(/usr/bin/docker -H $HOST inspect --format="{{ .NetworkSettings.IPAddress }}" $CONTAINER)
-    echo "$CONTAINER_U OK: Container is running and $HEALTH, IP: $NETWORK, StartedAt: $STARTED"
-    exit 0
-  fi
-  echo "OK: Docker engine running, containers=$nbContainers images=$nbImages"
-  exit 0
-elif [ $? -eq 1 ]; then
+$DOCKER ps > /dev/null 2>&1
+returncode=$?
+if [ $returncode -eq 1 ]; then
   echo "CRITICAL: Docker engine not running."
   exit 2
-else
+elif [ $returncode -ne 0 ]; then
   echo "UNKNOWN: Docker is in unknow state."
   exit 3
 fi
+
+if [[ -z "$CONTAINER" ]]; then
+  echo -n "OK: Docker engine running | Containers=$($DOCKER ps -q | wc -l) "
+  echo "Images=$($DOCKER images -q | wc -l)"
+  exit 0
+fi
+
+CONTAINER_U=$(echo $CONTAINER | tr [:lower:] [:upper:])
+RUNNING=$($INSPECT --format="${FMT_RUNNING}" $CONTAINER 2> /dev/null)
+if [ $? -eq 1 ]; then
+  echo "$CONTAINER_U CRITICAL: Container does not exist."
+  exit 2
+fi
+if [ "$RUNNING" == "false" ]; then
+  echo "$CONTAINER_U WARNING: Container is not running."
+  exit 1
+fi
+HEALTH=$($INSPECT --format="${FMT_HEALTH}" $CONTAINER 2> /dev/null)
+if [ -z "$HEALTH" ]; then
+  HEALTH="healthchecks are not implemented"
+elif [ "$HEALTH" != "healthy" ]; then
+  echo "$CONTAINER_U WARNING: Container is $HEALTH."
+  exit 1
+fi
+STARTED=$(date --date="$($INSPECT --format="${FMT_STARTED}" $CONTAINER)")
+if [ -z "$STARTED" ]; then
+  STARTED=${RAW_STARTED:-"Unknown"}
+  started_epoch=0
+else
+  started_epoch=$(date --date="$STARTED" +%s)
+fi
+now=$(date +%s)
+if [[ "$started_epoch" -gt $((now-60)) ]]; then
+  echo "$CONTAINER_U WARNING: Container just restarted at $(date \
+                                                            --date="$STARTED")"
+  exit 1
+fi
+NETWORK=$($INSPECT --format="${FMT_IP}" $CONTAINER)
+if [ -z "$NETWORK" ]; then
+  NETWORK=$($INSPECT --format="$FMT_NETWORK" $CONTAINER | sed 's/,$//')
+fi
+echo -n "$CONTAINER_U OK: Container is running and $HEALTH"
+echo " | IP: $NETWORK, StartedAt: $STARTED"
+exit 0

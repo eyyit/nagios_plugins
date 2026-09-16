@@ -1,58 +1,77 @@
 #!/usr/bin/python3
 
-
 import argparse
+import math
 import subprocess
 import sys
 
-exit = 2
-status = 'CRITICAL'
-verification = ''
-verify_passed = True
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--host', help='Hostname of the service to check.')
-parser.add_argument('--port', help='Port number to check', default='443')
-parser.add_argument('--server', help='Hostname of the server to connect to.')
-parser.add_argument('--timeout', type=int, help='Check timeout in seconds.',
-                    default=5)
-args = parser.parse_args()
-if not args.server:
-  args.server = args.host
-if not all([args.host, args.port, args.server]):
-  parser.error('Please specify all args.')
+class NagiosArgumentParser(argparse.ArgumentParser):
 
-cmd = ['openssl', 's_client', '-connect', f'{args.host}:{args.port}',
-       '-servername', args.server]
-print(' '.join(cmd))
-for attempt in range(4):
-  p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                       stderr=subprocess.PIPE, universal_newlines=True)
-  try:
-    stdout, stderr = p.communicate(timeout=args.timeout)
-  except subprocess.TimeoutExpired:
-    print(f'Check attempt {attempt} timed out.')
-    continue
-  break
+  def error(self, message):
+    print(f'CERT CHAIN UNKNOWN: {message}')
+    raise SystemExit(3)
 
-if p.returncode:
-  sys.exit(exit)
 
-for line in stderr.splitlines():
-  if line.startswith('verify'):
-    if line != 'verify return:1':
-      verify_passed = False
+def main():
+  parser = NagiosArgumentParser()
+  parser.add_argument('--host', required=True,
+                      help='Hostname of the service to check.')
+  parser.add_argument('--port', type=int, default=443,
+                      help='Port number to check (default: 443).')
+  parser.add_argument('--server',
+                      help='TLS server name (defaults to --host).')
+  parser.add_argument('--timeout', type=float, default=5,
+                      help='Check timeout in seconds (default: 5).')
+  args = parser.parse_args()
 
-for line in stdout.splitlines():
-  if 'verif' in line.lower():
-    verification = line.strip()
+  if not 1 <= args.port <= 65535:
+    parser.error('Port must be between 1 and 65535.')
+  if not math.isfinite(args.timeout) or args.timeout <= 0:
+    parser.error('Timeout must be a finite number greater than zero.')
+  server = args.server or args.host
+  command = [
+      'openssl', 's_client', '-connect', f'{args.host}:{args.port}',
+      '-servername', server,
+  ]
 
-if verification != 'Verify return code: 0 (ok)':
-  verify_passed = False
+  for attempt in range(1, 5):
+    try:
+      result = subprocess.run(
+          command, input='', capture_output=True, text=True,
+          timeout=args.timeout, check=False)
+    except subprocess.TimeoutExpired:
+      if attempt == 4:
+        print(f'CERT CHAIN UNKNOWN: Check timed out after {attempt} attempts.')
+        return 3
+      continue
+    except OSError as error:
+      print(f'CERT CHAIN UNKNOWN: Unable to run openssl: {error}')
+      return 3
+    break
 
-if verify_passed:
-  exit = 0
-  status = 'OK'
+  if result.returncode:
+    detail = result.stderr.strip().splitlines()
+    message = detail[-1] if detail else f'openssl exited {result.returncode}'
+    print(f'CERT CHAIN UNKNOWN: {message}')
+    return 3
 
-print(f'CERT CHAIN {status}: {verification}\n{stderr.rstrip()}')
-sys.exit(exit)
+  output = '\n'.join((result.stdout, result.stderr))
+  verification = ''
+  for line in output.splitlines():
+    if line.strip().startswith('Verify return code:'):
+      verification = line.strip()
+
+  if verification == 'Verify return code: 0 (ok)':
+    print(f'CERT CHAIN OK: {verification}')
+    return 0
+  if verification:
+    print(f'CERT CHAIN CRITICAL: {verification}')
+    return 2
+
+  print('CERT CHAIN UNKNOWN: openssl output did not contain verification status.')
+  return 3
+
+
+if __name__ == '__main__':
+  sys.exit(main())

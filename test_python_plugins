@@ -1,0 +1,471 @@
+#!/usr/bin/python3
+
+import contextlib
+import io
+import json
+import pathlib
+import subprocess
+import sys
+import tempfile
+import types
+import unittest
+from unittest import mock
+
+
+HERE = pathlib.Path(__file__).parent
+
+
+def load_plugin(name):
+  path = HERE / name
+  module = types.ModuleType(name)
+  module.__file__ = str(path)
+  exec(compile(path.read_bytes(), str(path), 'exec'), module.__dict__)
+  return module
+
+
+def run_main(module, arguments):
+  stdout = io.StringIO()
+  with mock.patch.object(sys, 'argv', [module.__name__, *arguments]), \
+       contextlib.redirect_stdout(stdout):
+    result = module.main()
+  return result, stdout.getvalue().strip()
+
+
+class CertificateChainTest(unittest.TestCase):
+
+  def setUp(self):
+    self.plugin = load_plugin('check_cert_chain')
+
+  def test_valid_chain_is_ok_and_command_is_argument_list(self):
+    completed = subprocess.CompletedProcess(
+        [], 0, 'Verify return code: 0 (ok)\n', '')
+    with mock.patch.object(
+        self.plugin.subprocess, 'run', return_value=completed) as run:
+      status, output = run_main(self.plugin, ['--host', 'example.com'])
+
+    self.assertEqual(0, status)
+    self.assertEqual(
+        'CERT CHAIN OK: Verify return code: 0 (ok)', output)
+    self.assertEqual(
+        ['openssl', 's_client', '-connect', 'example.com:443',
+         '-servername', 'example.com'], run.call_args.args[0])
+
+  def test_invalid_chain_is_critical(self):
+    completed = subprocess.CompletedProcess(
+        [], 0, 'Verify return code: 20 (unable to get local issuer)\n', '')
+    with mock.patch.object(
+        self.plugin.subprocess, 'run', return_value=completed):
+      status, output = run_main(self.plugin, ['--host', 'example.com'])
+
+    self.assertEqual(2, status)
+    self.assertIn('CERT CHAIN CRITICAL:', output)
+
+  def test_repeated_timeout_is_unknown(self):
+    timeout = subprocess.TimeoutExpired(['openssl'], 1)
+    with mock.patch.object(
+        self.plugin.subprocess, 'run', side_effect=timeout) as run:
+      status, output = run_main(
+          self.plugin, ['--host', 'example.com', '--timeout', '1'])
+
+    self.assertEqual(3, status)
+    self.assertIn('CERT CHAIN UNKNOWN:', output)
+    self.assertEqual(4, run.call_count)
+
+
+class DdnsTest(unittest.TestCase):
+
+  def setUp(self):
+    self.plugin = load_plugin('check_ddns')
+    self.response = mock.Mock()
+    self.response.text = 'fl=1\nip=192.0.2.10\n'
+
+  def test_matching_address_is_ok(self):
+    with mock.patch.object(
+        self.plugin.requests, 'get', return_value=self.response) as request, \
+         mock.patch.object(
+             self.plugin, 'resolve_hostname',
+             return_value={'192.0.2.10', '192.0.2.11'}):
+      status, output = run_main(self.plugin, ['example.com'])
+
+    self.assertEqual(0, status)
+    self.assertIn('DDNS OK:', output)
+    request.assert_called_once_with(self.plugin.URL, timeout=10)
+    self.response.raise_for_status.assert_called_once_with()
+
+  def test_mismatched_address_is_critical(self):
+    with mock.patch.object(
+        self.plugin.requests, 'get', return_value=self.response), \
+         mock.patch.object(
+             self.plugin, 'resolve_hostname', return_value={'192.0.2.11'}):
+      status, output = run_main(self.plugin, ['example.com'])
+
+    self.assertEqual(2, status)
+    self.assertIn('DDNS CRITICAL:', output)
+
+  def test_request_failure_is_unknown(self):
+    error = self.plugin.requests.ConnectionError('network down')
+    with mock.patch.object(self.plugin.requests, 'get', side_effect=error):
+      status, output = run_main(self.plugin, ['example.com'])
+
+    self.assertEqual(3, status)
+    self.assertEqual(
+        'DDNS UNKNOWN: Unable to query Cloudflare: network down', output)
+
+  def test_ipv6_address_uses_all_ipv6_results(self):
+    self.response.text = 'ip=2001:db8::2\n'
+    completed = subprocess.CompletedProcess(
+        [], 0, '2001:db8::1 STREAM host\n2001:db8::2 STREAM host\n', '')
+    with mock.patch.object(
+        self.plugin.requests, 'get', return_value=self.response), \
+         mock.patch.object(
+             self.plugin.subprocess, 'run', return_value=completed) as run:
+      status, output = run_main(self.plugin, ['example.com'])
+
+    self.assertEqual(0, status)
+    self.assertIn('DDNS OK:', output)
+    self.assertEqual(['getent', 'ahosts', 'example.com'], run.call_args.args[0])
+
+  def test_dns_timeout_is_unknown(self):
+    timeout = subprocess.TimeoutExpired(['getent'], 1)
+    with mock.patch.object(
+        self.plugin.requests, 'get', return_value=self.response), \
+         mock.patch.object(self.plugin.subprocess, 'run', side_effect=timeout):
+      status, output = run_main(
+          self.plugin, ['example.com', '--timeout', '1'])
+
+    self.assertEqual(3, status)
+    self.assertIn('DNS resolution timed out', output)
+
+
+class SabnzbdTest(unittest.TestCase):
+
+  def setUp(self):
+    self.plugin = load_plugin('check_sabnzbd')
+    self.response = mock.Mock()
+
+  def run_response(self, status):
+    self.response.json.return_value = {'status': status}
+    with mock.patch.object(
+        self.plugin.requests, 'get', return_value=self.response):
+      return run_main(self.plugin, ['--apikey', 'secret'])
+
+  def test_warning_is_warning_not_unknown(self):
+    result, output = self.run_response({
+        'warnings': [{'type': 'WARNING', 'text': 'Disk almost full'}],
+        'paused': False,
+    })
+
+    self.assertEqual(1, result)
+    self.assertEqual('SABNZBD WARNING: Disk almost full', output)
+
+  def test_error_is_critical(self):
+    result, output = self.run_response({
+        'warnings': [{'type': 'ERROR', 'text': 'Disk full'}],
+        'paused': False,
+    })
+
+    self.assertEqual(2, result)
+    self.assertEqual('SABNZBD CRITICAL: Disk full', output)
+
+  def test_invalid_response_is_unknown(self):
+    result, output = self.run_response({'paused': False})
+
+    self.assertEqual(3, result)
+    self.assertIn('SABNZBD UNKNOWN: Invalid API response:', output)
+
+  def test_http_error_does_not_expose_api_key(self):
+    response = self.plugin.requests.Response()
+    response.status_code = 500
+    response.url = 'https://sab.example/api?apikey=secret&mode=fullstatus'
+    error = self.plugin.requests.HTTPError(response=response)
+    response.raise_for_status = mock.Mock(side_effect=error)
+    with mock.patch.object(
+        self.plugin.requests, 'get', return_value=response):
+      status, output = run_main(self.plugin, [
+          '--apikey', 'secret', '--host', 'sab.example', '--scheme', 'https'])
+
+    self.assertEqual(3, status)
+    self.assertNotIn('secret', output)
+    self.assertIn('HTTPError', output)
+
+  def test_invalid_warning_text_type_is_unknown(self):
+    result, output = self.run_response({
+        'warnings': [{'type': 'WARNING', 'text': 123}],
+        'paused': False,
+    })
+
+    self.assertEqual(3, result)
+    self.assertIn('type and text must be strings', output)
+
+  def test_invalid_paused_type_is_unknown(self):
+    result, output = self.run_response({
+        'warnings': [],
+        'paused': 'false',
+    })
+
+    self.assertEqual(3, result)
+    self.assertIn('status.paused is not boolean', output)
+
+  def test_warning_text_is_collapsed_to_one_line(self):
+    result, output = self.run_response({
+        'warnings': [{'type': 'WARNING', 'text': 'Line one\r\nLine two'}],
+        'paused': False,
+    })
+
+    self.assertEqual(1, result)
+    self.assertEqual('SABNZBD WARNING: Line one Line two', output)
+
+
+class LogRateTest(unittest.TestCase):
+
+  def setUp(self):
+    self.plugin = load_plugin('check_log_rate')
+
+  def test_critical_rate(self):
+    samples = [
+        {'inode': 1, 'size': 0, 'timestamp': 0},
+        {'inode': 1, 'size': 122880, 'timestamp': 60},
+    ]
+
+    status, message = self.plugin.evaluate('/var/log/test', samples, 60, 1, 2)
+
+    self.assertEqual(2, status)
+    self.assertIn('120.00 KB/min', message)
+
+  def test_rotation_resets_state(self):
+    samples = [
+        {'inode': 1, 'size': 100, 'timestamp': 0},
+        {'inode': 2, 'size': 200, 'timestamp': 60},
+    ]
+
+    status, message = self.plugin.evaluate('/var/log/test', samples, 60, 1, 2)
+
+    self.assertEqual((0, 'Detected log rotation. Reset state.'),
+                     (status, message))
+
+  def test_state_file_name_does_not_contain_log_path(self):
+    state = self.plugin.get_state_path(
+        '/var/log/app/access.log', '/tmp/private-state')
+
+    self.assertTrue(state.startswith('/tmp/private-state/access.log_'))
+    self.assertNotIn('/var/log', state)
+
+  def test_rotation_resets_persisted_samples(self):
+    with tempfile.TemporaryDirectory() as state_root, \
+         mock.patch.object(self.plugin, 'STATE_ROOT', state_root), \
+         mock.patch.object(self.plugin, 'stat_file', side_effect=[
+             {'inode': 1, 'size': 100},
+             {'inode': 2, 'size': 10},
+             {'inode': 2, 'size': 20},
+         ]):
+      first = self.plugin.get_state('/var/log/test', 60, timestamp=0)
+      second = self.plugin.get_state('/var/log/test', 60, timestamp=60)
+      third = self.plugin.get_state('/var/log/test', 60, timestamp=120)
+      state_directory = self.plugin.get_state_directory()
+
+      self.assertEqual(1, len(first))
+      self.assertEqual([2], [sample['inode'] for sample in second])
+      self.assertEqual([2, 2], [sample['inode'] for sample in third])
+      self.assertEqual(0o700, pathlib.Path(state_directory).stat().st_mode & 0o777)
+
+  def test_invalid_utf8_state_is_treated_as_corrupt(self):
+    with tempfile.NamedTemporaryFile(delete=False) as state:
+      self.addCleanup(pathlib.Path(state.name).unlink, missing_ok=True)
+      state.write(b'\xff\xfe')
+
+    self.assertEqual([], self.plugin.read_state(state.name))
+
+  def test_world_writable_state_root_is_rejected(self):
+    with tempfile.TemporaryDirectory() as state_root:
+      pathlib.Path(state_root).chmod(0o777)
+      with mock.patch.object(self.plugin, 'STATE_ROOT', state_root), \
+           self.assertRaisesRegex(OSError, 'group/world writable'):
+        self.plugin.get_state_directory()
+
+  def test_foreign_owned_state_root_is_rejected(self):
+    with tempfile.TemporaryDirectory() as state_root:
+      real_stat = self.plugin.os.stat
+
+      def foreign_owner(path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        if path != state_root:
+          return result
+        return types.SimpleNamespace(
+            st_mode=result.st_mode, st_uid=result.st_uid + 1)
+
+      with mock.patch.object(self.plugin, 'STATE_ROOT', state_root), \
+           mock.patch.object(
+               self.plugin.os, 'stat', side_effect=foreign_owner), \
+           self.assertRaisesRegex(OSError, 'not owned by this user'):
+        self.plugin.get_state_directory()
+
+
+class MemoryAndSwapTest(unittest.TestCase):
+
+  def setUp(self):
+    self.memory = load_plugin('check_memory')
+    self.swap = load_plugin('check_swap')
+
+  def write_meminfo(self, contents):
+    handle = tempfile.NamedTemporaryFile('w', delete=False)
+    self.addCleanup(pathlib.Path(handle.name).unlink, missing_ok=True)
+    with handle:
+      handle.write(contents)
+    return handle.name
+
+  def test_memory_warning(self):
+    path = self.write_meminfo(
+        'MemTotal: 1024000 kB\nMemAvailable: 204800 kB\n')
+
+    result = self.memory.check_avail('MEMORY', 75, 90, path)
+
+    self.assertEqual((1, 'MEMORY WARNING: 80% used (800 MB out of 1000 MB)'),
+                     result)
+
+  def test_unconfigured_swap_is_ok(self):
+    path = self.write_meminfo('SwapTotal: 0 kB\nSwapFree: 0 kB\n')
+
+    result = self.swap.check_avail('SWAP', 75, 90, path)
+
+    self.assertEqual((0, 'SWAP OK: Swap is not configured (0 MB total)'), result)
+
+  def test_missing_meminfo_value_is_unknown_error(self):
+    path = self.write_meminfo('MemTotal: 1024000 kB\n')
+
+    with self.assertRaisesRegex(ValueError, 'MemAvailable'):
+      self.memory.check_avail('MEMORY', 75, 90, path)
+
+
+class SensorTest(unittest.TestCase):
+
+  def setUp(self):
+    self.plugin = load_plugin('check_sensor')
+
+  def test_sensor_command_uses_argument_list(self):
+    data = {'chip; touch /tmp/bad': {
+        'Adapter': 'ISA',
+        'Package': {'temp1_input': 120.0},
+    }}
+    completed = subprocess.CompletedProcess([], 0, json.dumps(data), '')
+    with mock.patch.object(
+        self.plugin.subprocess, 'run', return_value=completed) as run:
+      output = self.plugin.get_sensor_data('chip; touch /tmp/bad', 2)
+
+    self.assertEqual(data, output)
+    self.assertEqual(
+        ['/usr/bin/sensors', '-f', '-j', 'chip; touch /tmp/bad'],
+        run.call_args.args[0])
+
+  def test_metric_status(self):
+    data = {'chip': {
+        'Adapter': 'ISA',
+        'Package': {'temp1_input': 120.0},
+    }}
+    with mock.patch.object(
+        self.plugin, 'get_sensor_data', return_value=data):
+      result, output = run_main(self.plugin, [
+          '--metric', 'Package', '--warn', '100', '--crit', '140'])
+
+    self.assertEqual((1, 'Package', '120.0 °F'), result)
+    self.assertEqual('', output)
+
+  def test_duplicate_metric_is_unknown(self):
+    data = {
+        'chip1': {'Package': {'temp1_input': 100}},
+        'chip2': {'Package': {'temp2_input': 101}},
+    }
+    with mock.patch.object(
+        self.plugin, 'get_sensor_data', return_value=data):
+      result, _ = run_main(self.plugin, [
+          '--metric', 'Package', '--warn', '100', '--crit', '140'])
+
+    self.assertEqual(3, result[0])
+    self.assertIn('--sensor required', result[2])
+
+  def test_command_error_is_one_line(self):
+    completed = subprocess.CompletedProcess([], 1, '', 'first\nsecond\r\n')
+    with mock.patch.object(
+        self.plugin.subprocess, 'run', return_value=completed), \
+         self.assertRaisesRegex(
+             self.plugin.PluginError, 'sensors failed: first second'):
+      self.plugin.get_sensor_data()
+
+
+class SmartTest(unittest.TestCase):
+
+  def setUp(self):
+    self.plugin = load_plugin('check_smart')
+
+  def test_smartctl_command_uses_argument_list(self):
+    completed = subprocess.CompletedProcess([], 0, '{}', '')
+    with mock.patch.object(
+        self.plugin.subprocess, 'run', return_value=completed) as run:
+      self.plugin.get_smart_data('/dev/sda; touch /tmp/bad', timeout=2)
+
+    self.assertEqual(
+        ['/usr/sbin/smartctl', '--json', '-A',
+         '/dev/sda; touch /tmp/bad'], run.call_args.args[0])
+
+  def test_health_passes(self):
+    with mock.patch.object(
+        self.plugin, 'get_smart_data',
+        return_value={'smart_status': {'passed': True}}):
+      result = self.plugin.check_health('/dev/sda', 2)
+
+    self.assertEqual(
+        (0, 'SMART overall-health self-assessment test PASSED'), result)
+
+  def test_bad_json_is_unknown(self):
+    completed = subprocess.CompletedProcess([], 1, 'not json', 'device error')
+    with mock.patch.object(
+        self.plugin.subprocess, 'run', return_value=completed), \
+         self.assertRaises(self.plugin.PluginError) as raised:
+      self.plugin.get_smart_data('/dev/sda')
+
+    self.assertEqual(3, raised.exception.status)
+    self.assertIn('invalid smartctl JSON', str(raised.exception))
+
+  def test_health_infrastructure_failure_is_unknown(self):
+    completed = subprocess.CompletedProcess([], 2, '{}', '')
+    with mock.patch.object(
+        self.plugin.subprocess, 'run', return_value=completed), \
+         self.assertRaises(self.plugin.PluginError) as raised:
+      self.plugin.get_smart_data('/dev/sda', health=True)
+
+    self.assertEqual(3, raised.exception.status)
+
+  def test_disk_failure_bit_is_critical_for_attribute_query(self):
+    completed = subprocess.CompletedProcess([], 8, '{}', '')
+    with mock.patch.object(
+        self.plugin.subprocess, 'run', return_value=completed), \
+         self.assertRaises(self.plugin.PluginError) as raised:
+      self.plugin.get_smart_data('/dev/sda')
+
+    self.assertEqual(2, raised.exception.status)
+
+  def test_malformed_attribute_table_is_unknown(self):
+    data = {
+        'device': {'protocol': 'ATA'},
+        'ata_smart_attributes': {'table': None},
+    }
+    with mock.patch.object(
+        self.plugin, 'get_smart_data', return_value=data), \
+         self.assertRaises(self.plugin.PluginError) as raised:
+      self.plugin.check_attribute(22, '/dev/sda', 2)
+
+    self.assertEqual(3, raised.exception.status)
+    self.assertIn('list of objects', str(raised.exception))
+
+  def test_bad_json_stderr_is_one_line(self):
+    completed = subprocess.CompletedProcess([], 1, '', 'first\nsecond\r\n')
+    with mock.patch.object(
+        self.plugin.subprocess, 'run', return_value=completed), \
+         self.assertRaises(self.plugin.PluginError) as raised:
+      self.plugin.get_smart_data('/dev/sda')
+
+    self.assertEqual('invalid smartctl JSON: first second',
+                     str(raised.exception))
+
+
+if __name__ == '__main__':
+  unittest.main()

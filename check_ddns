@@ -1,52 +1,99 @@
 #!/usr/bin/python3
 
-import requests
-import socket
-import sys
 import argparse
+import ipaddress
+import math
+import subprocess
+import sys
+
+import requests
 
 
 URL = 'https://www.cloudflare.com/cdn-cgi/trace'
 
 
-def get_ip_from_hostname(hostname):
-  try:
-    return socket.gethostbyname(hostname)
-  except socket.gaierror:
-    print(f'Unable to resolve domain: {hostname}')
-    sys.exit(3)
+class NagiosArgumentParser(argparse.ArgumentParser):
+
+  def error(self, message):
+    print(f'DDNS UNKNOWN: {message}')
+    raise SystemExit(3)
 
 
-parser = argparse.ArgumentParser(
-  description='Compare the public IP with the DNS IP of a hostname.'
-)
-parser.add_argument('hostname', nargs=1,
-                    help='The hostname to compare against the Cloudflare IP.')
-args = parser.parse_args()
-hostname = args.hostname[0]
-
-# Get public IP from Cloudflare
-try:
-  r = requests.get(URL)
-  r.raise_for_status()  # Ensure request was successful
-  public_ip = None
-  for line in r.text.splitlines():
+def get_public_ip(timeout):
+  response = requests.get(URL, timeout=timeout)
+  response.raise_for_status()
+  for line in response.text.splitlines():
     if line.startswith('ip='):
-      public_ip = line.split('=')[-1]
-      break
-  if not public_ip:
-    print('Unable to extract IP from Cloudflare response.')
-    sys.exit(3)
-except Exception as e:
-    print(f'Error occurred: {str(e)}')
-    sys.exit(3)
+      return str(ipaddress.ip_address(line.partition('=')[2].strip()))
+  raise ValueError('Cloudflare response did not contain an IP address')
 
-hostname_ip = get_ip_from_hostname(hostname)
 
-if public_ip == hostname_ip:
-  print(f'{hostname} IP addresses match: {public_ip}')
-  sys.exit(0)
+def resolve_hostname(hostname, ip_version, timeout):
+  try:
+    result = subprocess.run(
+        ['getent', 'ahosts', hostname], capture_output=True, text=True,
+        timeout=timeout, check=False)
+  except subprocess.TimeoutExpired as error:
+    raise TimeoutError(
+        f'DNS resolution timed out after {timeout} seconds') from error
+  except OSError as error:
+    raise RuntimeError(f'unable to run getent: {error}') from error
+  if result.returncode:
+    raise RuntimeError(f'unable to resolve {hostname}')
 
-print(f'{args.hostname} IP addresses do not match. Cloudflare IP: {public_ip}, '
-      f'Hostname IP: {hostname_ip}')
-sys.exit(2)
+  addresses = set()
+  for line in result.stdout.splitlines():
+    fields = line.split()
+    if not fields:
+      continue
+    try:
+      address = ipaddress.ip_address(fields[0])
+    except ValueError:
+      continue
+    if address.version == ip_version:
+      addresses.add(str(address))
+  if not addresses:
+    raise RuntimeError(
+        f'{hostname} has no IPv{ip_version} addresses')
+  return addresses
+
+
+def main():
+  parser = NagiosArgumentParser(
+      description='Compare the public IP with the DNS IP of a hostname.')
+  parser.add_argument('hostname', help='Hostname to compare with the public IP.')
+  parser.add_argument('--timeout', type=float, default=10,
+                      help='HTTP timeout in seconds (default: 10).')
+  args = parser.parse_args()
+
+  if not math.isfinite(args.timeout) or args.timeout <= 0:
+    parser.error('Timeout must be a finite number greater than zero.')
+
+  try:
+    public_ip = get_public_ip(args.timeout)
+  except requests.RequestException as error:
+    print(f'DDNS UNKNOWN: Unable to query Cloudflare: {error}')
+    return 3
+  except ValueError as error:
+    print(f'DDNS UNKNOWN: {error}')
+    return 3
+
+  try:
+    version = ipaddress.ip_address(public_ip).version
+    hostname_ips = resolve_hostname(args.hostname, version, args.timeout)
+  except (RuntimeError, TimeoutError) as error:
+    print(f'DDNS UNKNOWN: {error}')
+    return 3
+
+  if public_ip in hostname_ips:
+    print(f'DDNS OK: {args.hostname} resolves to public IP {public_ip}.')
+    return 0
+
+  resolved = ', '.join(sorted(hostname_ips))
+  print(f'DDNS CRITICAL: {args.hostname} resolves to {resolved}, '
+        f'but public IP is {public_ip}.')
+  return 2
+
+
+if __name__ == '__main__':
+  sys.exit(main())

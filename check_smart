@@ -1,7 +1,8 @@
 #!/usr/bin/python3
 
+import argparse
 import json
-import optparse
+import math
 import subprocess
 import sys
 
@@ -10,153 +11,195 @@ ATTRIBUTE_CHECK_FIELDS = {
     22: 'raw',
     177: 'current',
 }
-EXIT_MSGS = [
+EXIT_MESSAGES = (
     'Command line did not parse.',
-    ('Device open failed, device did not return an IDENTIFY DEVICE structure, '
-     'or device is in a low-power mode (see \'-n\' option above).'),
-    ('Some SMART or other ATA command to the disk failed, or there was a '
-     'checksum error in a SMART data structure (see \'-b\' option above).'),
-    'SMART status check returned "DISK FAILING".',
-    'We found prefail Attributes <= threshold.',
-    ('SMART status check returned "DISK OK" but we found that some (usage or '
-     'prefail) Attributes have been <= threshold at some time in the past.'),
-    'The device error log contains records of errors.',
-    ('The device self-test log contains records of errors. [ATA only] Failed se'
-     'lf-tests outdated by a newer successful extended self-test are ignored.')
-]
-RETURN_VALUES = ['OK', 'WARNING', 'CRITICAL', 'UNKNOWN']
+    'Device open or IDENTIFY command failed.',
+    'A SMART command or data checksum failed.',
+    'SMART reports that the disk is failing.',
+    'A prefail attribute is at or below its threshold.',
+    'An attribute was at or below its threshold in the past.',
+    'The device error log contains errors.',
+    'The self-test log contains errors.',
+)
+RETURN_VALUES = ('OK', 'WARNING', 'CRITICAL', 'UNKNOWN')
 
 
-def get_correct_value(entry):
-  value = 3
-  entry_id = entry['id']
-  if ATTRIBUTE_CHECK_FIELDS[entry_id] == 'current':
-    value = entry['value']
-  elif ATTRIBUTE_CHECK_FIELDS[entry_id] == 'raw':
-    value = entry['raw']['value']
-  return value
+class PluginError(Exception):
 
-def check_attribute(attribute, disk):
-  entry = {}
-  data = get_smart_data(disk)
-  if data['device']['protocol'].lower() != 'ata':
-    return (3, 'Attributes only supported on ATA disks')
-  for i in data['ata_smart_attributes']['table']:
-    if i['id'] == attribute:
-      entry = i
-      break
-  if not entry:
-    return (3, f'Attribute {attribute} missing from output.')
-  name = entry['name']
-  current = entry['value']
-  worst = entry['worst']
-  thresh = entry['thresh']
-  raw = entry['raw']['value']
-  value = get_correct_value(entry)
-  msg = (f'{attribute} {name}: {value} (current: {current}, worst: {worst}, '
-         f'threshold: {thresh}, raw: {raw})')
-  return (value, msg)
+  def __init__(self, status, message):
+    super().__init__(message)
+    self.status = status
 
-def check_health(disk):
-  status = 2
-  value = 'FAILED'
-  data = get_smart_data(disk, health=True)
-  result = data['smart_status']['passed']
-  if result:
-    status = 0
-    value = 'PASSED'
-  msg = f'SMART overall-health self-assessment test {value}'
-  return (status, msg)
 
-def check_information(information, disk):
-  data = get_smart_data(disk)
-  if data['device']['protocol'].lower() != 'nvme':
-    return (3, 'Information only supported on NVMe disks')
-  value = data['nvme_smart_health_information_log'][information]
-  msg = f'{information.replace("_", " ").title()}: {value}'
-  return (value, msg)
+class NagiosArgumentParser(argparse.ArgumentParser):
 
-def check_temp(disk):
-  to_f = lambda value: (1.8 * value) + 32
-  data = get_smart_data(disk)
-  if not data:
-    return ('UNKNOWN', 'No temperature attributes in SMART output.')
-  value = to_f(data['temperature']['current'])
-  msg = f'Temperature {disk}: {value:0.1f}°F'
-  return (value, msg)
+  def error(self, message):
+    print(f'SMART UNKNOWN: {message}')
+    raise SystemExit(3)
 
-def get_smart_data(disk, health=False):
-  op = '-A'
-  if health:
-    op = '-H'
-  return_code, out = subprocess.getstatusoutput(
-      f'/usr/sbin/smartctl --json {op} {disk}')
-  data = json.loads(out)
-  if return_code:
-    if health:
-      msg = ''
-      mask = 1
-      for bit in range(0, 8):
-        if return_code & mask:
-          msg += f' Bit {bit}: {EXIT_MSGS[bit]}'
-        mask <<= 1
-      print(f'SMART HEALTH CRITICAL: {msg}')
-      sys.exit(2)
-    print(f"SMART UNKNOWN: {data['smartctl']['messages'][0]['string']}")
-    sys.exit(3)
-  return data
+
+def one_line(value):
+  return ' '.join(value.splitlines()).strip()
+
 
 def get_status(value, warn, crit):
-  val = float(value)
   if crit > warn:
-    if val >= crit:
+    if value >= crit:
       return 2
-    elif val >= warn:
+    if value >= warn:
       return 1
   else:
-    if val <= crit:
+    if value <= crit:
       return 2
-    elif val <= warn:
+    if value <= warn:
       return 1
   return 0
 
-def main():
-  parser = optparse.OptionParser()
-  parser.add_option('--attribute', type='int')
-  parser.add_option('--disk')
-  parser.add_option('--health', action='store_true')
-  parser.add_option('--information', type='str')
-  parser.add_option('--temp', action='store_true')
-  parser.add_option('--warn', type='float')
-  parser.add_option('--crit', type='float')
-  (args, _) = parser.parse_args()
-  error = ''
-  if args.crit and args.warn and args.crit == args.warn:
-    error = '--warn and --crit should not be equal.'
-  if (any([args.attribute, args.information, args.temp]) and not
-      (args.warn and args.crit)):
-    error = 'Provide --warn and --crit'
-  if not any([args.attribute, args.health, args.information, args.temp]):
-    error = 'Provide --attribute, --health, --information, or --temp.'
-  if not args.disk or not args.disk.startswith('/dev/'):
-    error = 'Provide --disk starting with /dev/'
-  if error:
-    parser.print_help()
-    parser.error(error)
 
-  if args.health:
-    return check_health(args.disk)
-  if args.attribute:
-    value, msg = check_attribute(args.attribute, args.disk)
-  elif args.information:
-    value, msg = check_information(args.information, args.disk)
-  elif args.temp:
-    value, msg = check_temp(args.disk)
-  else:
-    return (3, 'Wrong arguments')
-  return (get_status(value, args.warn, args.crit), msg)
+def decode_exit_status(returncode):
+  messages = [message for bit, message in enumerate(EXIT_MESSAGES)
+              if returncode & (1 << bit)]
+  return ' '.join(messages) or f'smartctl exited {returncode}'
+
+
+def get_smart_data(disk, health=False, timeout=15):
+  operation = '-H' if health else '-A'
+  command = ['/usr/sbin/smartctl', '--json', operation, disk]
+  try:
+    result = subprocess.run(
+        command, capture_output=True, text=True, timeout=timeout, check=False)
+  except subprocess.TimeoutExpired as error:
+    raise PluginError(3, f'smartctl timed out after {timeout} seconds') from error
+  except OSError as error:
+    raise PluginError(3, f'unable to run smartctl: {error}') from error
+
+  try:
+    data = json.loads(result.stdout)
+  except (json.JSONDecodeError, TypeError) as error:
+    detail = one_line(result.stderr) or str(error)
+    raise PluginError(3, f'invalid smartctl JSON: {detail}') from error
+  if not isinstance(data, dict):
+    raise PluginError(3, 'invalid smartctl JSON: expected an object')
+  if result.returncode:
+    infrastructure_bits = result.returncode & 0b00000111
+    status = 3 if infrastructure_bits else 2
+    raise PluginError(status, decode_exit_status(result.returncode))
+  return data
+
+
+def check_attribute(attribute, disk, timeout):
+  data = get_smart_data(disk, timeout=timeout)
+  try:
+    if data['device']['protocol'].lower() != 'ata':
+      raise PluginError(3, 'attributes are only supported on ATA disks')
+    entries = data['ata_smart_attributes']['table']
+  except (KeyError, TypeError, AttributeError) as error:
+    raise PluginError(3, f'missing ATA attribute data: {error}') from error
+
+  if (not isinstance(entries, list) or
+      not all(isinstance(entry, dict) for entry in entries)):
+    raise PluginError(3, 'ATA attribute table must be a list of objects')
+
+  entry = next((item for item in entries if item.get('id') == attribute), None)
+  if entry is None:
+    raise PluginError(3, f'attribute {attribute} is missing from output')
+  try:
+    value = (entry['value'] if ATTRIBUTE_CHECK_FIELDS[attribute] == 'current'
+             else entry['raw']['value'])
+    message = (f'{attribute} {entry["name"]}: {value} '
+               f'(current: {entry["value"]}, worst: {entry["worst"]}, '
+               f'threshold: {entry["thresh"]}, raw: {entry["raw"]["value"]})')
+    numeric_value = float(value)
+  except (KeyError, TypeError, ValueError) as error:
+    raise PluginError(3, f'invalid attribute {attribute} data: {error}') from error
+  if not math.isfinite(numeric_value):
+    raise PluginError(3, f'attribute {attribute} value is not finite')
+  return numeric_value, message
+
+
+def check_health(disk, timeout):
+  data = get_smart_data(disk, health=True, timeout=timeout)
+  try:
+    passed = data['smart_status']['passed']
+  except (KeyError, TypeError) as error:
+    raise PluginError(3, f'missing SMART health status: {error}') from error
+  if not isinstance(passed, bool):
+    raise PluginError(3, 'SMART health status is not boolean')
+  if passed:
+    return 0, 'SMART overall-health self-assessment test PASSED'
+  return 2, 'SMART overall-health self-assessment test FAILED'
+
+
+def check_information(information, disk, timeout):
+  data = get_smart_data(disk, timeout=timeout)
+  try:
+    if data['device']['protocol'].lower() != 'nvme':
+      raise PluginError(3, 'information is only supported on NVMe disks')
+    value = data['nvme_smart_health_information_log'][information]
+    numeric_value = float(value)
+  except (KeyError, TypeError, ValueError, AttributeError) as error:
+    raise PluginError(3, f'invalid NVMe information data: {error}') from error
+  if not math.isfinite(numeric_value):
+    raise PluginError(3, f'{information} value is not finite')
+  message = f'{information.replace("_", " ").title()}: {value}'
+  return numeric_value, message
+
+
+def check_temperature(disk, timeout):
+  data = get_smart_data(disk, timeout=timeout)
+  try:
+    celsius = float(data['temperature']['current'])
+  except (KeyError, TypeError, ValueError) as error:
+    raise PluginError(3, f'invalid temperature data: {error}') from error
+  if not math.isfinite(celsius):
+    raise PluginError(3, 'temperature is not finite')
+  fahrenheit = 1.8 * celsius + 32
+  return fahrenheit, f'Temperature {disk}: {fahrenheit:0.1f}°F'
+
+
+def main():
+  parser = NagiosArgumentParser()
+  parser.add_argument('--disk', required=True)
+  operation = parser.add_mutually_exclusive_group(required=True)
+  operation.add_argument('--attribute', type=int,
+                         choices=tuple(ATTRIBUTE_CHECK_FIELDS))
+  operation.add_argument('--health', action='store_true')
+  operation.add_argument('--information')
+  operation.add_argument('--temp', action='store_true')
+  parser.add_argument('--warn', type=float)
+  parser.add_argument('--crit', type=float)
+  parser.add_argument('--timeout', type=float, default=15)
+  args = parser.parse_args()
+
+  if not args.disk.startswith('/dev/'):
+    parser.error('--disk must start with /dev/.')
+  if not math.isfinite(args.timeout) or args.timeout <= 0:
+    parser.error('--timeout must be a finite number greater than zero.')
+  if not args.health:
+    if args.warn is None or args.crit is None:
+      parser.error('Provide --warn and --crit for this operation.')
+    if not all(math.isfinite(value) for value in (args.warn, args.crit)):
+      parser.error('Thresholds must be finite numbers.')
+    if args.warn == args.crit:
+      parser.error('--warn and --crit must not be equal.')
+
+  try:
+    if args.health:
+      return check_health(args.disk, args.timeout)
+    if args.attribute is not None:
+      value, message = check_attribute(
+          args.attribute, args.disk, args.timeout)
+    elif args.information:
+      value, message = check_information(
+          args.information, args.disk, args.timeout)
+    else:
+      value, message = check_temperature(args.disk, args.timeout)
+    return get_status(value, args.warn, args.crit), message
+  except PluginError as error:
+    return error.status, str(error)
+
 
 if __name__ == '__main__':
-  (status, msg) = main()
-  print(f'{RETURN_VALUES[status]}: {msg}')
+  status, message = main()
+  print(f'SMART {RETURN_VALUES[status]}: {message}')
   sys.exit(status)

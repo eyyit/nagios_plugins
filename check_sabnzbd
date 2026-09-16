@@ -1,42 +1,94 @@
 #!/usr/bin/python3
 
 import argparse
+import math
 import sys
+
 import requests
 
 
 URI = '/sabnzbd/api'
-
-
-parser = argparse.ArgumentParser()
-parser.add_argument('-a', '--apikey', required=True)
-parser.add_argument('--host', default='127.0.0.1')
-parser.add_argument('--port', default='8080')
-parser.add_argument('--scheme', default='http')
-args = parser.parse_args()
-
-url = f'{args.scheme}://{args.host}:{args.port}{URI}'
-payload = {
-    'apikey': args.apikey,
-    'mode': 'fullstatus',
-    'output': 'json',
+SEVERITIES = {
+    'WARNING': 1,
+    'ERROR': 2,
 }
-status = requests.get(url, params=payload).json()['status']
 
-exit_status = 0
-msg = 'OK'
-for message in status['warnings']:
-  msg = message['text']
-  if not exit_status and message['type'] == 'WARNING':
-    exit_status = 1
-  if message['type'] == 'ERROR':
-    exit_status = 2
-  else:
-    exit_status = 3
 
-if not exit_status and status['paused']:
-  exit_status = 1
-  msg = 'Paused'
+def one_line(value):
+  return ' '.join(value.splitlines()).strip()
 
-print(msg)
-sys.exit(exit_status)
+
+class NagiosArgumentParser(argparse.ArgumentParser):
+
+  def error(self, message):
+    print(f'SABNZBD UNKNOWN: {message}')
+    raise SystemExit(3)
+
+
+def main():
+  parser = NagiosArgumentParser()
+  parser.add_argument('-a', '--apikey', required=True)
+  parser.add_argument('--host', default='127.0.0.1')
+  parser.add_argument('--port', type=int, default=8080)
+  parser.add_argument('--scheme', choices=('http', 'https'), default='http')
+  parser.add_argument('--timeout', type=float, default=10)
+  args = parser.parse_args()
+
+  if not 1 <= args.port <= 65535:
+    parser.error('Port must be between 1 and 65535.')
+  if not math.isfinite(args.timeout) or args.timeout <= 0:
+    parser.error('Timeout must be a finite number greater than zero.')
+
+  url = f'{args.scheme}://{args.host}:{args.port}{URI}'
+  payload = {
+      'apikey': args.apikey,
+      'mode': 'fullstatus',
+      'output': 'json',
+  }
+  try:
+    response = requests.get(url, params=payload, timeout=args.timeout)
+    response.raise_for_status()
+    status = response.json()['status']
+    warnings = status['warnings']
+    paused = status['paused']
+    if not isinstance(warnings, list):
+      raise ValueError('status.warnings is not a list')
+    if not isinstance(paused, bool):
+      raise ValueError('status.paused is not boolean')
+  except requests.RequestException as error:
+    print(f'SABNZBD UNKNOWN: Unable to query {url}: '
+          f'{type(error).__name__}')
+    return 3
+  except (KeyError, TypeError, ValueError) as error:
+    print(f'SABNZBD UNKNOWN: Invalid API response: {error}')
+    return 3
+
+  exit_status = 0
+  messages = []
+  for warning in warnings:
+    if not isinstance(warning, dict):
+      print('SABNZBD UNKNOWN: Invalid warning entry: expected an object')
+      return 3
+    warning_type = warning.get('type')
+    warning_text = warning.get('text')
+    if not isinstance(warning_type, str) or not isinstance(warning_text, str):
+      print('SABNZBD UNKNOWN: Invalid warning entry: '
+            'type and text must be strings')
+      return 3
+    severity = SEVERITIES.get(warning_type, 3)
+    messages.append(one_line(warning_text))
+    exit_status = max(exit_status, severity)
+
+  if paused:
+    exit_status = max(exit_status, 1)
+    messages.append('Paused')
+  if not messages:
+    messages.append('No warnings')
+
+  labels = ('OK', 'WARNING', 'CRITICAL', 'UNKNOWN')
+  print(f'SABNZBD {labels[exit_status]}: {"; ".join(messages)}')
+  return exit_status
+
+
+if __name__ == '__main__':
+  sys.exit(main())

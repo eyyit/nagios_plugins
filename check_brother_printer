@@ -1,58 +1,143 @@
 #!/usr/bin/python3
 
 import argparse
-import requests
+import math
 import re
+import socket
 import sys
-import traceback
+import time
+
+import requests
 
 
 REGEXES = {
-    'drum': r'Drum&#32;Unit\*.*?<dd>(\d+?)%</dd>',
-    'page_counter': r'<dt>Page&#32;Counter</dt><dd>(\d+?)</dd>',
-    'toner': r'Toner\*\*.*?<dd>(\d+?)%</dd>',
+    'drum': (r'<dt>\s*Drum&#32;Unit\*\s*</dt>\s*'
+             r'<dd>\s*(\d+)%\s*</dd>'),
+    'page_counter': (r'<dt>\s*Page&#32;Counter\s*</dt>\s*'
+                     r'<dd>\s*(\d+)\s*</dd>'),
+    'toner': (r'<dt>\s*Toner\*\*\s*</dt>\s*'
+              r'<dd>\s*(\d+)%\s*</dd>'),
 }
+
+WAKE_JOB = (
+    b'\x1b%-12345X'
+    b'@PJL JOB NAME="NAGIOS WAKE CHECK"\r\n'
+    b'@PJL USTATUS JOB=ON\r\n'
+    b'@PJL ENTER LANGUAGE=PCL\r\n'
+    b'\x1bE'
+    b'\x1b%-12345X'
+    b'@PJL EOJ NAME="NAGIOS WAKE CHECK"\r\n'
+    b'\x1b%-12345X'
+)
+
+
+class NagiosArgumentParser(argparse.ArgumentParser):
+
+  def error(self, message):
+    print(f'UNKNOWN: {message}')
+    raise SystemExit(3)
 
 
 def lookup(key, html):
-  match = re.search(REGEXES[key], html)
+  match = re.search(REGEXES[key], html, re.DOTALL)
   if not match:
-    print(f'UNKNOWN: {key}: {url} source does not match for {REGEXES[key]}.')
-    sys.exit(3)
+    raise ValueError(f'{key} value was not found in the printer response')
   return int(match.group(1))
+
+
+def query_supplies(url, timeout):
+  response = requests.get(url, timeout=timeout)
+  response.raise_for_status()
+  drum = lookup('drum', response.text)
+  toner = lookup('toner', response.text)
+  page_counter = lookup('page_counter', response.text)
+  if not all(0 <= supply <= 100 for supply in (drum, toner)):
+    raise ValueError('supply percentages must be between 0 and 100')
+  return drum, toner, page_counter
+
+
+def wake_printer(host, port, timeout):
+  with socket.create_connection((host, port), timeout=timeout) as connection:
+    connection.sendall(WAKE_JOB)
+    connection.shutdown(socket.SHUT_WR)
 
 
 def main():
   exit_status = 0
 
-  parser = argparse.ArgumentParser()
+  parser = NagiosArgumentParser()
   parser.add_argument('host', help='Printer to check.')
-  parser.add_argument('--drum-warn', help='Drum warning percent.')
-  parser.add_argument('--drum-crit', help='Drum critical percent.')
-  parser.add_argument('--toner-warn', help='Toner warning percent.')
-  parser.add_argument('--toner-crit', help='Toner critical percent.')
+  parser.add_argument('--drum-warn', type=int, required=True,
+                      help='Drum warning percent.')
+  parser.add_argument('--drum-crit', type=int, required=True,
+                      help='Drum critical percent.')
+  parser.add_argument('--toner-warn', type=int, required=True,
+                      help='Toner warning percent.')
+  parser.add_argument('--toner-crit', type=int, required=True,
+                      help='Toner critical percent.')
+  parser.add_argument('--timeout', type=float, default=10,
+                      help='HTTP timeout in seconds (default: 10).')
+  parser.add_argument('--wake-port', type=int, default=9100,
+                      help='Raw printing port used to wake the printer '
+                           '(default: 9100).')
+  parser.add_argument('--wake-timeout', type=float, default=8,
+                      help='Wake connection timeout in seconds (default: 8).')
+  parser.add_argument('--wake-delay', type=float, default=10,
+                      help='Seconds to wait before retrying after a wake '
+                           '(default: 10).')
   args = parser.parse_args()
 
-  if not args.host:
-    parser.error('Must specify host.')
-  elif not args.drum_warn or not args.toner_warn:
-    parser.error('Must specify warning levels.')
-  elif not args.drum_crit or not args.toner_crit:
-    parser.error('Must specify critical levels.')
+  thresholds = (args.drum_warn, args.drum_crit,
+                args.toner_warn, args.toner_crit)
+  if not all(0 <= threshold <= 100 for threshold in thresholds):
+    parser.error('Thresholds must be between 0 and 100.')
+  if args.drum_crit > args.drum_warn:
+    parser.error('Drum critical threshold must not exceed warning threshold.')
+  if args.toner_crit > args.toner_warn:
+    parser.error('Toner critical threshold must not exceed warning threshold.')
+  if not math.isfinite(args.timeout) or args.timeout <= 0:
+    parser.error('Timeout must be a finite number greater than zero.')
+  if not 1 <= args.wake_port <= 65535:
+    parser.error('Wake port must be between 1 and 65535.')
+  if not math.isfinite(args.wake_timeout) or args.wake_timeout <= 0:
+    parser.error('Wake timeout must be a finite number greater than zero.')
+  if not math.isfinite(args.wake_delay) or args.wake_delay < 0:
+    parser.error('Wake delay must be a finite number greater than or equal to zero.')
 
   url = f'http://{args.host}/general/information.html'
-  html = requests.get(url).text
-  drum = lookup('drum', html)
-  toner = lookup('toner', html)
-  page_counter = lookup('page_counter', html)
+  try:
+    drum, toner, page_counter = query_supplies(url, args.timeout)
+  except requests.RequestException as first_error:
+    wake_error = None
+    try:
+      wake_printer(args.host, args.wake_port, args.wake_timeout)
+    except OSError as error:
+      wake_error = error
+    time.sleep(args.wake_delay)
+    try:
+      drum, toner, page_counter = query_supplies(url, args.timeout)
+    except requests.RequestException as retry_error:
+      details = f'initial query failed: {first_error}'
+      if wake_error is not None:
+        details += f'; wake failed: {wake_error}'
+      details += f'; retry failed: {retry_error}'
+      print(f'UNKNOWN: Unable to query {url} after wake attempt: {details}')
+      return 3
+    except ValueError as error:
+      print(f'UNKNOWN: Unable to parse {url} after wake attempt: {error}')
+      return 3
+  except ValueError as error:
+    print(f'UNKNOWN: Unable to parse {url}: {error}')
+    return 3
+
   output = f'Drum: {drum}%, Toner: {toner}%, '
-  output += f'Page counter: {lookup("page_counter", html)}.'
-  if (int(args.drum_crit) >= drum or
-      int(args.toner_crit) >= toner):
+  output += f'Page counter: {page_counter}.'
+  if (args.drum_crit >= drum or
+      args.toner_crit >= toner):
     output = f'CRITICAL: {output}'
     exit_status = 2
-  elif (int(args.drum_warn) >= drum or
-      int(args.toner_warn) >= toner):
+  elif (args.drum_warn >= drum or
+      args.toner_warn >= toner):
     output = f'WARNING: {output}'
     exit_status = 1
   else:
@@ -62,8 +147,4 @@ def main():
 
 
 if __name__ == '__main__':
-  try:
-    sys.exit(main())
-  except Exception as e:
-    traceback.print_exc()
-    sys.exit(3)
+  sys.exit(main())

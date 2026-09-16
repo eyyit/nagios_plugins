@@ -1,143 +1,195 @@
 #!/usr/bin/env python3
 
 import argparse
-import os
-import sys
+import hashlib
 import json
+import math
+import os
+import stat
+import sys
+import tempfile
 import time
 
 
-EXIT_STATUSES = {
-    0: 'OK',
-    1: 'WARNING',
-    2: 'CRITICAL',
-    3: 'UNKNOWN',
-}
-MIN_REQUIRED_DELTA = 60 * 60  # 1 Hour.
+EXIT_STATUSES = ('OK', 'WARNING', 'CRITICAL', 'UNKNOWN')
+MIN_REQUIRED_DELTA = 60 * 60
+STATE_ROOT = '/run/nagios'
 
 
-def do_exit(code, msg):
-  print(f'{EXIT_STATUSES[code]} - {msg}')
-  sys.exit(code)
+class NagiosArgumentParser(argparse.ArgumentParser):
+
+  def error(self, message):
+    print(f'UNKNOWN - {message}')
+    raise SystemExit(3)
 
 
 def format_size(size):
-  units = ['B', 'KB', 'MB', 'GB']
+  units = ('B', 'KB', 'MB', 'GB', 'TB')
+  value = float(size)
   unit = units[0]
-  for u in units[1:]:
-    if size < 1024:
+  for unit in units:
+    if abs(value) < 1024 or unit == units[-1]:
       break
-    size /= 1024
-    unit = u
-  return f'{size:.2f} {unit}'
+    value /= 1024
+  return f'{value:.2f} {unit}'
 
 
-def get_state_path(logfile):
-  safe_name = logfile.replace('/', '_').lstrip('_')
-  return f'/var/tmp/nagios_log_rate_state_{safe_name}.json'
+def get_state_directory():
+  root_stat = os.stat(STATE_ROOT, follow_symlinks=False)
+  if not stat.S_ISDIR(root_stat.st_mode):
+    raise OSError(f'State root is not a directory: {STATE_ROOT}')
+  if root_stat.st_uid != os.geteuid():
+    raise OSError(f'State root is not owned by this user: {STATE_ROOT}')
+  if stat.S_IMODE(root_stat.st_mode) & 0o022:
+    raise OSError(f'State root is group/world writable: {STATE_ROOT}')
+
+  directory = os.path.join(STATE_ROOT, 'log-rate')
+  os.makedirs(directory, mode=0o700, exist_ok=True)
+  directory_stat = os.stat(directory, follow_symlinks=False)
+  if not stat.S_ISDIR(directory_stat.st_mode):
+    raise OSError(f'State path is not a directory: {directory}')
+  if directory_stat.st_uid != os.geteuid():
+    raise OSError(f'State directory is not owned by this user: {directory}')
+  if stat.S_IMODE(directory_stat.st_mode) != 0o700:
+    os.chmod(directory, 0o700)
+  return directory
 
 
-def get_state(logfile, min_age):
-  statefile = get_state_path(logfile)
-  timestamp = int(time.time())
-  valid_samples = []
-  samples = read_state(logfile, statefile)
-  newest = stat_file(logfile)
-  newest.update({'timestamp': timestamp})
-  samples.append(newest)
-
-  # Validate samples.
-  for sample in samples:
-    if all(x in sample for x in ['inode', 'size', 'timestamp']):
-      # Remove samples older than age window plus some wiggle room.
-      if timestamp - sample['timestamp'] <= min_age * 2:
-        valid_samples.append(sample)
-  valid_samples.sort(key=lambda sample: sample['timestamp'])
-
-  with open(statefile, 'w') as f:
-    json.dump(valid_samples, f)
-  return valid_samples
+def get_state_path(logfile, directory=None):
+  if directory is None:
+    directory = get_state_directory()
+  digest = hashlib.sha256(os.path.abspath(logfile).encode()).hexdigest()[:16]
+  name = os.path.basename(logfile).replace(os.sep, '_') or 'log'
+  return os.path.join(directory, f'{name}_{digest}.json')
 
 
-def read_state(logfile, statefile):
+def read_state(statefile):
   try:
-    with open(statefile, 'r') as f:
-      state = json.load(f)
-  except Exception:
+    with open(statefile, encoding='utf-8') as state_handle:
+      state = json.load(state_handle)
+  except (OSError, UnicodeError, json.JSONDecodeError):
     return []
-  if not isinstance(state, list):
-    return []
-  return state
+  return state if isinstance(state, list) else []
 
 
 def stat_file(filename):
+  file_stat = os.stat(filename)
+  return {'inode': file_stat.st_ino, 'size': file_stat.st_size}
+
+
+def get_state(logfile, min_age, timestamp=None):
+  state_directory = get_state_directory()
+  statefile = get_state_path(logfile, state_directory)
+  now = int(time.time()) if timestamp is None else timestamp
+  samples = read_state(statefile)
+
+  valid_samples = []
+  for sample in samples:
+    if (isinstance(sample, dict) and
+        all(isinstance(sample.get(key), int)
+            for key in ('inode', 'size', 'timestamp')) and
+        0 <= now - sample['timestamp'] <= min_age * 2):
+      valid_samples.append(sample)
+  valid_samples.sort(key=lambda sample: sample['timestamp'])
+
+  newest = stat_file(logfile)
+  newest['timestamp'] = now
+  if valid_samples:
+    previous = valid_samples[-1]
+    if (newest['inode'] != previous['inode'] or
+        newest['size'] < previous['size']):
+      valid_samples = []
+  valid_samples.append(newest)
+
+  descriptor = None
+  temporary = None
   try:
-    stat = os.stat(filename)
-  except Exception as error:
-    do_exit(3, f'Failed to stat file: {error}')
-  return {'inode': stat.st_ino, 'size': stat.st_size}
+    descriptor, temporary = tempfile.mkstemp(
+        prefix='.tmp-', dir=state_directory, text=True)
+    with os.fdopen(descriptor, 'w', encoding='utf-8') as state_handle:
+      descriptor = None
+      json.dump(valid_samples, state_handle)
+    os.replace(temporary, statefile)
+  except OSError:
+    if descriptor is not None:
+      os.close(descriptor)
+    try:
+      if temporary is not None:
+        os.unlink(temporary)
+    except OSError:
+      pass
+    raise
+  return valid_samples
 
 
-parser = argparse.ArgumentParser(
-  description='Check log growth rate per hour and alert if above threshold')
-parser.add_argument('logfile', help='Path to the logfile to monitor')
-parser.add_argument('-m', '--min-age', type=int, default=MIN_REQUIRED_DELTA,
-                    help=('Minimum age of state data in seconds before '
-                          f'evaluation (default: {MIN_REQUIRED_DELTA})'))
-parser.add_argument('-w', '--warning', type=int, required=True,
-                    help='Warning threshold in KB/min')
-parser.add_argument('-c', '--critical', type=int, required=True,
-                    help='Critical threshold in KB/min')
+def evaluate(logfile, samples, min_age, warning, critical):
+  if len(samples) < 2:
+    return 0, 'Waiting for more data (initializing sample history)'
 
-args = parser.parse_args()
-logfile = args.logfile
-min_age = args.min_age
-warn_thresh = args.warning
-crit_thresh = args.critical
+  oldest = samples[0]
+  newest = samples[-1]
+  delta_size = newest['size'] - oldest['size']
+  delta_time = newest['timestamp'] - oldest['timestamp']
 
-if not os.path.isfile(logfile):
-  do_exit(3, f'Log file not found: {logfile}')
+  if newest['inode'] != oldest['inode']:
+    return 0, 'Detected log rotation. Reset state.'
+  if delta_size < 0:
+    return 0, 'Detected log truncation. Reset state.'
+  if delta_time <= 0:
+    return 3, f'Invalid time delta: {delta_time} seconds'
+  if delta_time < min_age:
+    minutes = delta_time // 60
+    required = min_age // 60
+    return 0, (f'Waiting for more data ({minutes} minutes collected, need '
+               f'{required}) before evaluating log growth rate.')
 
-samples = get_state(logfile, min_age)
+  bytes_per_second = delta_size / delta_time
+  bytes_per_minute = delta_size * 60 / delta_time
+  rate_kb_per_minute = bytes_per_minute / 1024
+  if rate_kb_per_minute >= critical:
+    status = 2
+  elif rate_kb_per_minute >= warning:
+    status = 1
+  else:
+    status = 0
 
-if len(samples) < 2:
-  do_exit(0, 'Waiting for more data (initializing sample history)')
+  message = (
+      f'{logfile} grew {format_size(delta_size)} in {delta_time} seconds'
+      f' -- Rate: {format_size(bytes_per_second)}/s '
+      f'({format_size(bytes_per_minute)}/min)'
+      f' -- Thresholds (KB/min): warn: {warning}, crit: {critical}')
+  return status, message
 
-oldest = samples[0]
-newest = samples[-1]
 
-delta_size = newest['size'] - oldest['size']
-delta_time = newest['timestamp'] - oldest['timestamp']
+def main():
+  parser = NagiosArgumentParser(
+      description='Check log growth rate per hour and alert above thresholds.')
+  parser.add_argument('logfile', help='Path to the logfile to monitor.')
+  parser.add_argument('-m', '--min-age', type=int, default=MIN_REQUIRED_DELTA,
+                      help='Minimum sample age in seconds.')
+  parser.add_argument('-w', '--warning', type=float, required=True,
+                      help='Warning threshold in KB/min.')
+  parser.add_argument('-c', '--critical', type=float, required=True,
+                      help='Critical threshold in KB/min.')
+  args = parser.parse_args()
 
-if newest['inode'] != oldest['inode']:
-  do_exit(0, 'Detected log rotation. Reset state.')
-if delta_size < 0:
-  do_exit(0, 'Detected log truncation. Reset state.')
-if delta_time <= 0:
-  do_exit(3, f'Invalid time delta: {delta_time} seconds')
-if delta_time < min_age:
-  minutes = delta_time // 60
-  required = min_age // 60
-  do_exit(0, (f'Waiting for more data ({minutes} minutes collected, need '
-              f'{required}) before evaluating log growth rate.'))
+  if args.min_age <= 0:
+    parser.error('--min-age must be greater than zero.')
+  if (not all(math.isfinite(value)
+              for value in (args.warning, args.critical)) or
+      not 0 <= args.warning < args.critical):
+    parser.error('Thresholds must satisfy 0 <= warning < critical.')
+  if not os.path.isfile(args.logfile):
+    return 3, f'Log file not found: {args.logfile}'
+  try:
+    samples = get_state(args.logfile, args.min_age)
+  except OSError as error:
+    return 3, f'Unable to update state: {error}'
+  return evaluate(
+      args.logfile, samples, args.min_age, args.warning, args.critical)
 
-bytes_per_sec = delta_size / delta_time
-bytes_per_min = delta_size * 60 / delta_time
-rate_kb_per_min = int(bytes_per_min / 1024)
 
-if rate_kb_per_min >= crit_thresh:
-  exit_code = 2
-elif rate_kb_per_min >= warn_thresh:
-  exit_code = 1
-else:
-  exit_code = 0
-
-rate_sec_fmt = format_size(bytes_per_sec) + '/s'
-rate_min_fmt = format_size(bytes_per_min) + '/min'
-since_str = f'{delta_time} seconds'
-
-do_exit(exit_code, (
-  f'{logfile} grew {format_size(delta_size)} in {since_str}'
-  f' -- Rate: {rate_sec_fmt} ({rate_min_fmt})'
-  f' -- Thresholds (KB/min): warn: {warn_thresh}, crit: {crit_thresh}'
-))
+if __name__ == '__main__':
+  exit_status, message = main()
+  print(f'{EXIT_STATUSES[exit_status]} - {message}')
+  sys.exit(exit_status)
