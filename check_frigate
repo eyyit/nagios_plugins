@@ -1,0 +1,180 @@
+#!/usr/bin/python3
+"""Read-only Frigate camera/recording and cgroup-memory Nagios checks."""
+from __future__ import annotations
+
+import argparse
+import datetime
+import json
+import math
+import subprocess
+import sys
+import time
+from typing import Any
+
+CAMERAS = ('Doorbell', 'Garage', 'Kitchen', 'Kids')
+DIAGNOSTIC = r'''
+import contextlib,json,pathlib,sqlite3,sys,time,urllib.request
+mode,camera=sys.argv[1:3]
+if mode == 'memory':
+ p=pathlib.Path('/sys/fs/cgroup')
+ def pairs(name):
+  return dict((k,int(v)) for k,v in (line.split() for line in (p/name).read_text().splitlines()))
+ print(json.dumps({'current':int((p/'memory.current').read_text()),'limit':int((p/'memory.max').read_text()),'stat':pairs('memory.stat'),'events':pairs('memory.events')}))
+else:
+ def api(path):
+  with urllib.request.urlopen('http://127.0.0.1:5000'+path,timeout=5) as response:
+   return json.load(response)
+ config=api('/api/config')['cameras'].get(camera)
+ now=time.time()
+ cutoff=now-900
+ with contextlib.closing(sqlite3.connect('file:/config/frigate.db?mode=ro',uri=True,timeout=2)) as db:
+  row=db.execute('SELECT end_time,path FROM recordings WHERE camera=? ORDER BY end_time DESC LIMIT 1',(camera,)).fetchone()
+  recent=db.execute('SELECT start_time,end_time,path FROM recordings WHERE camera=? AND end_time>=? ORDER BY start_time',(camera,cutoff)).fetchall()
+  anchor=db.execute('SELECT MAX(end_time) FROM recordings WHERE camera=? AND end_time<?',(camera,cutoff)).fetchone()[0]
+ recording_end=None if row is None else row[0]
+ file_exists=False if row is None else pathlib.Path(row[1]).is_file()
+ missing=sum(not pathlib.Path(path).is_file() for start,end,path in recent)
+ intervals=([[anchor,anchor]] if anchor is not None else [])+[[start,end] for start,end,path in recent]
+ print(json.dumps({'camera_config':None if config is None else {'enabled':config['enabled'],'record_enabled':config['record']['enabled']},'recording_end':recording_end,'file_exists':file_exists,'now':now,'recording_intervals':intervals,'missing_recent_files':missing}))
+'''
+
+
+def finite(value: Any) -> float:
+    """Reject non-numeric or non-finite diagnostics."""
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError('Non-finite diagnostic')
+    return number
+
+
+def recording_gaps(intervals: list[list[float]], now: float) -> list[tuple[float, float]]:
+    """Find recovered coverage holes >=30s intersecting the last 15 minutes.
+
+    Merge overlapping segments, clip holes to the lookback, and leave the
+    unfinished tail to the separate recording-age thresholds. No prior segment
+    means unknown earlier coverage, not proof of an earlier recording gap.
+    """
+    cutoff = now - 900
+    previous_end: float | None = None
+    gaps: list[tuple[float, float]] = []
+    normalized = sorted((finite(start), finite(end)) for start, end in intervals)
+    for start, end in normalized:
+        if end < start or end > now + 60:
+            raise ValueError('Invalid recording interval')
+        if previous_end is not None:
+            gap_start = max(previous_end, cutoff)
+            if start - gap_start >= 30:
+                gaps.append((gap_start, start))
+        previous_end = max(previous_end if previous_end is not None else end, end)
+    return gaps
+
+
+def evaluate_camera(data: dict[str, Any], uptime: float,
+                    warning: float, critical: float) -> tuple[int, str]:
+    """Evaluate saved recording freshness and recent continuity, never FPS."""
+    config = data['camera_config']
+    if config is None:
+        return 2, 'expected camera missing'
+    if not config['enabled'] or not config['record_enabled']:
+        return 2, 'expected camera or recording disabled'
+    if uptime < 300:
+        return 0, f'startup grace ({uptime:.0f}/300 seconds)'
+    now = finite(data['now'])
+    gaps = recording_gaps(data['recording_intervals'], now)
+    missing = int(data['missing_recent_files'])
+    if missing < 0:
+        raise ValueError('Invalid missing file count')
+    end = data['recording_end']
+    age = None if end is None else max(0, now - finite(end))
+    code = 0
+    if age is None or not data['file_exists'] or missing or age > critical:
+        code = 2
+    elif age > warning or gaps:
+        code = 1
+    age_text = 'no saved file' if age is None or not data['file_exists'] else f'{age:.0f}s'
+    perf_age = 'U' if age is None else f'{age:.1f}s'
+    gap_text = 'none'
+    if gaps:
+        # Explicit UTC timestamps are independent of the host or email timezone.
+        gap_text = ', '.join(
+            f'{datetime.datetime.fromtimestamp(start, datetime.timezone.utc).isoformat(timespec="seconds")}'
+            f'..{datetime.datetime.fromtimestamp(stop, datetime.timezone.utc).isoformat(timespec="seconds")}'
+            f' ({stop - start:.0f}s)' for start, stop in gaps
+        )
+    return code, (f'recording_age={age_text}; recovered_gaps_15m={len(gaps)} [{gap_text}];'
+                  f' missing_recent_files={missing}'
+                  f' | recording_age={perf_age};{warning};{critical};0'
+                  f' recovered_gaps_15m={len(gaps)};0;;0'
+                  f' missing_recent_files={missing};0;0;0')
+
+
+def evaluate_memory(data: dict[str, Any], warning: float,
+                    critical: float) -> tuple[int, str]:
+    """Retain tmpfs/shmem in working-set usage; expose cumulative event counters."""
+    current, limit = int(data['current']), int(data['limit'])
+    if current < 0 or limit <= 0:
+        raise ValueError('Invalid memory limit or usage')
+    working = max(0, current - int(data['stat']['inactive_file']))
+    percent = 100 * working / limit
+    code = 2 if percent >= critical else 1 if percent >= warning else 0
+    events = data['events']
+    return code, (f'working_set={working / 2**20:.0f}MiB/{limit / 2**20:.0f}MiB ({percent:.1f}%)'
+                  f' | working_set_pct={percent:.2f}%;{warning};{critical};0;100'
+                  f' memory_current={current}B;;;0;{limit} memory_working_set={working}B;;;0;{limit}'
+                  f' memory_limit={limit}B;;;0 max_events={int(events["max"])}c'
+                  f' oom_events={int(events["oom"])}c oom_kills={int(events["oom_kill"])}c')
+
+
+def execute(command: list[str], deadline: float) -> str:
+    """Bound combined Docker operations to twenty seconds; suppress raw stderr."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise subprocess.TimeoutExpired(command, 20)
+    result = subprocess.run(command, capture_output=True, text=True,
+                            timeout=remaining, check=True)
+    return result.stdout
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Return Nagios status without printing configuration or upstream secrets."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest='mode', required=True)
+    camera = commands.add_parser('camera')
+    camera.add_argument('camera', choices=CAMERAS)
+    camera.add_argument('--warning-age', type=float, default=120)
+    camera.add_argument('--critical-age', type=float, default=300)
+    memory = commands.add_parser('memory')
+    memory.add_argument('--warning', type=float, default=85)
+    memory.add_argument('--critical', type=float, default=95)
+    args = parser.parse_args(argv)
+    try:
+        deadline = time.monotonic() + 20
+        info = json.loads(execute(['/usr/bin/docker', 'inspect', '--format', '{{json .State}}', 'frigate'], deadline))
+        if not info['Running']:
+            print('FRIGATE CRITICAL: container not running')
+            return 2
+        started = datetime.datetime.fromisoformat(info['StartedAt'].replace('Z', '+00:00'))
+        uptime = time.time() - started.timestamp()
+        if args.mode == 'camera' and uptime < 300:
+            print(f'FRIGATE {args.camera} OK: startup grace ({uptime:.0f}/300 seconds)')
+            return 0
+        name = getattr(args, 'camera', '')
+        raw = execute(['/usr/bin/docker', 'exec', 'frigate', 'python3', '-c', DIAGNOSTIC, args.mode, name], deadline)
+        data = json.loads(raw)
+        if args.mode == 'camera':
+            if not 0 <= args.warning_age < args.critical_age:
+                raise ValueError('Invalid age thresholds')
+            code, message = evaluate_camera(data, uptime, args.warning_age, args.critical_age)
+        else:
+            if not 0 <= args.warning < args.critical <= 100:
+                raise ValueError('Invalid memory thresholds')
+            code, message = evaluate_memory(data, args.warning, args.critical)
+        print(f'FRIGATE {name or "memory"} {("OK", "WARNING", "CRITICAL")[code]}: {message}')
+        return code
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError, KeyError, OverflowError) as error:
+        print(f'FRIGATE UNKNOWN: diagnostic failed ({type(error).__name__}); check Docker permissions, API/schema and deadlines')
+        return 3
+
+
+if __name__ == '__main__':
+    sys.exit(main())
