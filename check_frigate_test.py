@@ -127,5 +127,19 @@ class FrigateChecks(unittest.TestCase):
             check.evaluate_camera(self.camera, 600, 120, 300)
 
 
+class QualityClassifierTests(unittest.TestCase):
+    def test_timestamp_only_requires_successful_decode(self):
+        namespace = {}
+        exec(check.QUALITY_CLASSIFIER, namespace)
+        classify = namespace['quality_status']
+        warning = '[null @ 0x624243347000] Application provided invalid, non monotonically increasing dts to muxer in stream 0: 244 >= 244'
+        self.assertEqual(classify(0, warning, 300), 'ok')
+        self.assertEqual(classify(0, '', 300), 'ok')
+        for code, text, frames in ((1, warning, 300), (0, warning, 0),
+                                   (0, warning+'\n[h264 @ 0xabc] no frame!', 300),
+                                   (0, 'unknown diagnostic', 300)):
+            self.assertEqual(classify(code, text, frames), 'bad')
+
+
 if __name__ == '__main__':
     unittest.main()

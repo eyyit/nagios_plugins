@@ -12,7 +12,15 @@ import time
 from typing import Any
 
 CAMERAS = ('Doorbell', 'Garage', 'Kitchen', 'Kids')
-DIAGNOSTIC = r'''
+QUALITY_CLASSIFIER = r'''
+import re
+def quality_status(returncode, stderr, frames):
+ # Only this null-output muxer diagnostic is harmless when decoding succeeds.
+ timestamp = re.compile(r'^\[null @ 0x[0-9a-fA-F]+\] Application provided invalid, non monotonically increasing dts to muxer in stream 0: -?\d+ >= -?\d+$')
+ lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+ return 'ok' if returncode == 0 and frames > 0 and all(timestamp.fullmatch(line) for line in lines) else 'bad'
+'''
+DIAGNOSTIC = QUALITY_CLASSIFIER + r'''
 import contextlib,json,pathlib,sqlite3,subprocess,sys,time,urllib.request
 mode,camera=sys.argv[1:3]
 if mode == 'memory':
@@ -46,7 +54,7 @@ else:
    try:
     probe=subprocess.run(['/usr/lib/ffmpeg/8.0/bin/ffmpeg','-v','error','-xerror','-threads','1','-i',str(target),'-map','0:v:0','-an','-sn','-dn','-f','null','-','-progress','pipe:1'],capture_output=True,text=True,timeout=2)
     frames=[int(line.split('=',1)[1]) for line in probe.stdout.splitlines() if line.startswith('frame=')]
-    status='ok' if probe.returncode==0 and not probe.stderr.strip() and max(frames,default=0)>0 else 'bad'
+    status=quality_status(probe.returncode,probe.stderr,max(frames,default=0))
    except subprocess.TimeoutExpired: status='timeout'
   quality.append({'end':end,'status':status})
   if len(quality)==3: break
