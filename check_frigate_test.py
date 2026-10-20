@@ -14,6 +14,34 @@ loader.exec_module(check)
 
 
 class FrigateChecks(unittest.TestCase):
+    def test_quality_thresholds_and_recovery(self):
+        for statuses, expected in ((['ok','ok','ok'],0), (['bad','ok','ok'],0),
+                                   (['bad','bad','ok'],1), (['bad','bad','bad'],2),
+                                   (['timeout','ok','ok'],3)):
+            with self.subTest(statuses=statuses):
+                samples=[{'end':990-i*30,'status':status} for i,status in enumerate(statuses)]
+                self.assertEqual(check.evaluate_quality(samples,1000)[0],expected)
+
+    def test_quality_needs_spaced_recent_samples(self):
+        for ends in ([990,989,988],[990,960],[800,770,740]):
+            samples=[{'end':end,'status':'bad'} for end in ends]
+            self.assertEqual(check.evaluate_quality(samples,1000)[0],0)
+
+    def test_quality_integrates_with_recording_and_cannot_hide_outage(self):
+        self.camera['quality']=[{'end':990-i*30,'status':'bad'} for i in range(3)]
+        code,text=check.evaluate_camera(self.camera,600,120,300)
+        self.assertEqual(code,2)
+        self.assertIn('quality_bad=3/3',text)
+        self.camera['quality'][0]['status']='ok'
+        self.assertEqual(check.evaluate_camera(self.camera,600,120,300)[0],1)
+        self.camera['quality']=[{'end':990,'status':'timeout'}]
+        self.camera['recording_end']=0
+        self.assertEqual(check.evaluate_camera(self.camera,600,120,300)[0],2)
+
+    def test_quality_rejects_unknown_status(self):
+        with self.assertRaises(ValueError):
+            check.evaluate_quality([{'end':990,'status':'secret'}],1000)
+
     def setUp(self):
         self.camera = {'camera_config': {'enabled': True, 'record_enabled': True}, 'stats': {'camera_fps': 5, 'process_fps': 5}, 'recording_end': 980, 'now': 1000, 'file_exists': True, 'recording_intervals': [[900, 980]], 'missing_recent_files': 0}
 
