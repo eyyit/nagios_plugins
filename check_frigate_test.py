@@ -127,6 +127,59 @@ class FrigateChecks(unittest.TestCase):
             check.evaluate_camera(self.camera, 600, 120, 300)
 
 
+class AudioClassifierTests(unittest.TestCase):
+    def setUp(self):
+        namespace = {}
+        exec(check.AUDIO_CLASSIFIER, namespace)
+        self.classify = namespace['audio_status']
+        self.streams = [dict(codec_type='video', start_time='0', duration='10'),
+                        dict(codec_type='audio', start_time='0.02', duration='10')]
+
+    def test_aligned_audio_and_silence_are_healthy(self):
+        self.assertEqual(self.classify(self.streams), 'ok')
+        self.streams[1]['start_time'] = '-0.02'
+        self.assertEqual(self.classify(self.streams), 'ok')
+
+    def test_observed_garage_offset_is_bad(self):
+        self.streams[1].update(start_time='43893.710000', duration='0.031104')
+        self.assertEqual(self.classify(self.streams), 'bad')
+
+    def test_missing_audio_and_truncated_audio_are_bad(self):
+        self.assertEqual(self.classify(self.streams[:1]), 'bad')
+        self.streams[1]['duration'] = '0.03'
+        self.assertEqual(self.classify(self.streams), 'bad')
+
+    def test_skew_boundary_and_excessive_tail(self):
+        self.streams[1].update(start_time='2', duration='8')
+        self.assertEqual(self.classify(self.streams), 'ok')
+        self.streams[1]['start_time'] = '2.001'
+        self.assertEqual(self.classify(self.streams), 'bad')
+        self.streams[1].update(start_time='0', duration='13')
+        self.assertEqual(self.classify(self.streams), 'bad')
+
+    def test_invalid_metadata_is_unknown_not_healthy(self):
+        for value in ('N/A', 'nan', 'inf', None):
+            self.streams[1]['duration'] = value
+            self.assertEqual(self.classify(self.streams), 'unavailable')
+
+    def test_audio_failures_reach_camera_check(self):
+        data = dict(camera_config=dict(enabled=True, record_enabled=True), now=1000,
+                    recording_end=990, file_exists=True, recording_intervals=[[900,990]],
+                    missing_recent_files=0, quality=[], audio_expected=True)
+        for statuses, expected in ((['bad','bad','bad'],2), (['bad','bad','ok'],1),
+                                   (['ok','ok','ok'],0), (['timeout','ok','ok'],3)):
+            data['audio_quality'] = [dict(end=990-i*30, status=s) for i,s in enumerate(statuses)]
+            code, message = check.evaluate_camera(data, 600, 120, 300)
+            self.assertEqual(code, expected)
+            self.assertIn('audio_bad=', message)
+        data['audio_expected'] = False
+        self.assertEqual(check.evaluate_camera(data, 600, 120, 300)[0], 0)
+        data['quality'] = [dict(end=990, status='timeout')]
+        self.assertEqual(check.evaluate_camera(data, 600, 120, 300)[0], 3)
+        data.update(recording_end=500, audio_expected=True)
+        self.assertEqual(check.evaluate_camera(data, 600, 120, 300)[0], 2)
+
+
 class QualityClassifierTests(unittest.TestCase):
     def test_timestamp_only_requires_successful_decode(self):
         namespace = {}

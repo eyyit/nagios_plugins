@@ -20,7 +20,31 @@ def quality_status(returncode, stderr, frames):
  lines = [line.strip() for line in stderr.splitlines() if line.strip()]
  return 'ok' if returncode == 0 and frames > 0 and all(timestamp.fullmatch(line) for line in lines) else 'bad'
 '''
-DIAGNOSTIC = QUALITY_CLASSIFIER + r'''
+AUDIO_CLASSIFIER = r'''
+import math
+def audio_status(streams: list[dict]) -> str:
+ """Check audio presence and alignment without treating silence as failure."""
+ videos = [s for s in streams if s.get('codec_type') == 'video']
+ audios = [s for s in streams if s.get('codec_type') == 'audio']
+ if not videos or not audios:
+  return 'bad'
+ try:
+  video_start, video_duration = (float(videos[0][key]) for key in ('start_time', 'duration'))
+  audio_start, audio_duration = (float(audios[0][key]) for key in ('start_time', 'duration'))
+ except (KeyError, TypeError, ValueError):
+  return 'unavailable'
+ if not all(math.isfinite(v) for v in (video_start, video_duration, audio_start, audio_duration)):
+  return 'unavailable'
+ if video_duration <= 0 or audio_duration <= 0:
+  return 'bad'
+ tolerance = max(2.0, video_duration * 0.2)
+ if abs(audio_start - video_start) > 2.0:
+  return 'bad'
+ if abs(audio_start + audio_duration - video_start - video_duration) > tolerance:
+  return 'bad'
+ return 'ok'
+'''
+DIAGNOSTIC = QUALITY_CLASSIFIER + AUDIO_CLASSIFIER + r'''
 import contextlib,json,pathlib,sqlite3,subprocess,sys,time,urllib.request
 mode,camera=sys.argv[1:3]
 if mode == 'memory':
@@ -44,6 +68,9 @@ else:
  missing=sum(not pathlib.Path(path).is_file() for start,end,path in recent)
  intervals=([[anchor,anchor]] if anchor is not None else [])+[[start,end] for start,end,path in recent]
  quality=[]
+ audio_quality=[]
+ record_args=[] if config is None else config['ffmpeg']['output_args']['record']
+ audio_expected=('audio' in record_args) if isinstance(record_args,str) else ('-an' not in record_args and any(arg in record_args for arg in ('-c:a','-codec:a','-acodec')))
  last_end=now+100
  for start,end,path in reversed(recent):
   if end<now-120 or end>last_end-25: continue
@@ -57,8 +84,22 @@ else:
     status=quality_status(probe.returncode,probe.stderr,max(frames,default=0))
    except subprocess.TimeoutExpired: status='timeout'
   quality.append({'end':end,'status':status})
+  if audio_expected:
+   audio='unavailable'
+   if target.is_relative_to(pathlib.Path('/media/frigate/recordings')) and target.is_file():
+    try:
+     metadata=subprocess.run(['/usr/lib/ffmpeg/8.0/bin/ffprobe','-v','error','-show_entries','stream=codec_type,start_time,duration','-of','json',str(target)],capture_output=True,text=True,timeout=2)
+     if metadata.returncode==0:
+      audio=audio_status(json.loads(metadata.stdout).get('streams',[]))
+     if audio=='ok':
+      decoded=subprocess.run(['/usr/lib/ffmpeg/8.0/bin/ffmpeg','-v','error','-xerror','-threads','1','-i',str(target),'-map','0:a:0','-vn','-sn','-dn','-f','null','-','-progress','pipe:1'],capture_output=True,text=True,timeout=2)
+      progress=[int(line.split('=',1)[1]) for line in decoded.stdout.splitlines() if line.startswith('out_time_us=') and line.split('=',1)[1].lstrip('-').isdigit()]
+      audio=quality_status(decoded.returncode,decoded.stderr,max(progress,default=0))
+    except subprocess.TimeoutExpired: audio='timeout'
+    except (json.JSONDecodeError,ValueError,TypeError): audio='unavailable'
+   audio_quality.append({'end':end,'status':audio})
   if len(quality)==3: break
- print(json.dumps({'camera_config':None if config is None else {'enabled':config['enabled'],'record_enabled':config['record']['enabled']},'recording_end':recording_end,'file_exists':file_exists,'now':now,'recording_intervals':intervals,'missing_recent_files':missing,'quality':quality}))
+ print(json.dumps({'camera_config':None if config is None else {'enabled':config['enabled'],'record_enabled':config['record']['enabled']},'recording_end':recording_end,'file_exists':file_exists,'now':now,'recording_intervals':intervals,'missing_recent_files':missing,'quality':quality,'audio_expected':audio_expected,'audio_quality':audio_quality}))
 '''
 
 
@@ -115,9 +156,14 @@ def evaluate_camera(data: dict[str, Any], uptime: float,
     elif age > warning or gaps:
         code = 1
     quality_code, quality_text, bad, sampled = evaluate_quality(data.get('quality', []), now)
+    audio_code, audio_text, audio_bad, audio_sampled = (0, 'audio_not_required', 0, 0)
+    if data.get('audio_expected', False):
+        audio_code, audio_text, audio_bad, audio_sampled = evaluate_quality(data.get('audio_quality', []), now)
+        audio_text = audio_text.replace('quality_bad=', 'audio_bad=')
     # A definite recording failure outranks a diagnostic timeout (UNKNOWN).
-    if code != 2:
-        code = 3 if quality_code == 3 and code == 0 else max(code, quality_code if quality_code != 3 else 1)
+    codes = (code, quality_code, audio_code)
+    known_code = max(value for value in codes if value != 3)
+    code = known_code if known_code else 3 if 3 in codes else 0
     age_text = 'no saved file' if age is None or not data['file_exists'] else f'{age:.0f}s'
     perf_age = 'U' if age is None else f'{age:.1f}s'
     gap_text = 'none'
@@ -129,11 +175,12 @@ def evaluate_camera(data: dict[str, Any], uptime: float,
             f' ({stop - start:.0f}s)' for start, stop in gaps
         )
     return code, (f'recording_age={age_text}; recovered_gaps_15m={len(gaps)} [{gap_text}];'
-                  f' missing_recent_files={missing}; {quality_text}'
+                  f' missing_recent_files={missing}; {quality_text}; {audio_text}'
                   f' | recording_age={perf_age};{warning};{critical};0'
                   f' recovered_gaps_15m={len(gaps)};0;;0'
                   f' missing_recent_files={missing};0;0;0'
-                  f' quality_bad={bad};2;3;0;{sampled} quality_samples={sampled};;;0;3')
+                  f' quality_bad={bad};2;3;0;{sampled} quality_samples={sampled};;;0;3'
+                  f' audio_bad={audio_bad};2;3;0;{audio_sampled} audio_samples={audio_sampled};;;0;3')
 
 
 def evaluate_quality(samples: list[dict[str, Any]], now: float) -> tuple[int, str, int, int]:
