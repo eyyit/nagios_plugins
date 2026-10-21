@@ -18,7 +18,17 @@ def quality_status(returncode, stderr, frames):
  # Only this null-output muxer diagnostic is harmless when decoding succeeds.
  timestamp = re.compile(r'^\[null @ 0x[0-9a-fA-F]+\] Application provided invalid, non monotonically increasing dts to muxer in stream 0: -?\d+ >= -?\d+$')
  lines = [line.strip() for line in stderr.splitlines() if line.strip()]
- return 'ok' if returncode == 0 and frames > 0 and all(timestamp.fullmatch(line) for line in lines) else 'bad'
+ if returncode != 0 or frames <= 0:
+  return 'bad'
+ previous_timestamp = False
+ for line in lines:
+  if timestamp.fullmatch(line):
+   previous_timestamp = True
+  elif previous_timestamp and re.fullmatch(r'Last message repeated \d+ times', line):
+   continue
+  else:
+   return 'bad'
+ return 'ok'
 '''
 AUDIO_CLASSIFIER = r'''
 import math
