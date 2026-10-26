@@ -54,7 +54,25 @@ def audio_status(streams: list[dict]) -> str:
   return 'bad'
  return 'ok'
 '''
-DIAGNOSTIC = QUALITY_CLASSIFIER + AUDIO_CLASSIFIER + r'''
+AUDIO_DETAILS = r'''
+def audio_details(streams: list[dict]) -> tuple[str, str]:
+ """Separate audio presence/decoding from A/V clock or video-tail mismatch."""
+ combined = audio_status(streams)
+ if combined != 'bad':
+  return combined, 'ok' if combined == 'ok' else combined
+ videos = [s for s in streams if s.get('codec_type') == 'video']
+ audios = [s for s in streams if s.get('codec_type') == 'audio']
+ if not videos or not audios:
+  return 'bad', 'ok'
+ try:
+  vd, ad = float(videos[0]['duration']), float(audios[0]['duration'])
+ except (KeyError, TypeError, ValueError):
+  return 'unavailable', 'unavailable'
+ if vd <= 0 or ad <= 0 or ad < min(0.1, vd * 0.1):
+  return 'bad', 'ok'
+ return 'ok', 'bad'
+'''
+DIAGNOSTIC = QUALITY_CLASSIFIER + AUDIO_CLASSIFIER + AUDIO_DETAILS + r'''
 import contextlib,json,pathlib,sqlite3,subprocess,sys,time,urllib.request
 mode,camera=sys.argv[1:3]
 if mode == 'memory':
@@ -68,7 +86,7 @@ else:
    return json.load(response)
  config=api('/api/config')['cameras'].get(camera)
  now=time.time()
- cutoff=now-900
+ cutoff=now-3600
  with contextlib.closing(sqlite3.connect('file:/config/frigate.db?mode=ro',uri=True,timeout=2)) as db:
   row=db.execute('SELECT end_time,path FROM recordings WHERE camera=? ORDER BY end_time DESC LIMIT 1',(camera,)).fetchone()
   recent=db.execute('SELECT start_time,end_time,path FROM recordings WHERE camera=? AND end_time>=? ORDER BY start_time',(camera,cutoff)).fetchall()
@@ -79,6 +97,7 @@ else:
  intervals=([[anchor,anchor]] if anchor is not None else [])+[[start,end] for start,end,path in recent]
  quality=[]
  audio_quality=[]
+ timing_quality=[]
  record_args=[] if config is None else config['ffmpeg']['output_args']['record']
  audio_expected=('audio' in record_args) if isinstance(record_args,str) else ('-an' not in record_args and any(arg in record_args for arg in ('-c:a','-codec:a','-acodec')))
  last_end=now+100
@@ -96,11 +115,12 @@ else:
   quality.append({'end':end,'status':status})
   if audio_expected:
    audio='unavailable'
+   timing='unavailable'
    if target.is_relative_to(pathlib.Path('/media/frigate/recordings')) and target.is_file():
     try:
      metadata=subprocess.run(['/usr/lib/ffmpeg/8.0/bin/ffprobe','-v','error','-show_entries','stream=codec_type,start_time,duration','-of','json',str(target)],capture_output=True,text=True,timeout=2)
      if metadata.returncode==0:
-      audio=audio_status(json.loads(metadata.stdout).get('streams',[]))
+      audio,timing=audio_details(json.loads(metadata.stdout).get('streams',[]))
      if audio=='ok':
       decoded=subprocess.run(['/usr/lib/ffmpeg/8.0/bin/ffmpeg','-v','error','-xerror','-threads','1','-i',str(target),'-map','0:a:0','-vn','-sn','-dn','-f','null','-','-progress','pipe:1'],capture_output=True,text=True,timeout=2)
       progress=[int(line.split('=',1)[1]) for line in decoded.stdout.splitlines() if line.startswith('out_time_us=') and line.split('=',1)[1].lstrip('-').isdigit()]
@@ -108,8 +128,9 @@ else:
     except subprocess.TimeoutExpired: audio='timeout'
     except (json.JSONDecodeError,ValueError,TypeError): audio='unavailable'
    audio_quality.append({'end':end,'status':audio})
+   timing_quality.append({'end':end,'status':timing})
   if len(quality)==3: break
- print(json.dumps({'camera_config':None if config is None else {'enabled':config['enabled'],'record_enabled':config['record']['enabled']},'recording_end':recording_end,'file_exists':file_exists,'now':now,'recording_intervals':intervals,'missing_recent_files':missing,'quality':quality,'audio_expected':audio_expected,'audio_quality':audio_quality}))
+ print(json.dumps({'camera_config':None if config is None else {'enabled':config['enabled'],'record_enabled':config['record']['enabled']},'recording_end':recording_end,'file_exists':file_exists,'now':now,'recording_intervals':intervals,'missing_recent_files':missing,'quality':quality,'audio_expected':audio_expected,'audio_quality':audio_quality,'timing_quality':timing_quality}))
 '''
 
 
@@ -121,14 +142,15 @@ def finite(value: Any) -> float:
     return number
 
 
-def recording_gaps(intervals: list[list[float]], now: float) -> list[tuple[float, float]]:
+def recording_gaps(intervals: list[list[float]], now: float,
+                   lookback: float = 900, minimum_gap: float = 30) -> list[tuple[float, float]]:
     """Find recovered coverage holes >=30s intersecting the last 15 minutes.
 
     Merge overlapping segments, clip holes to the lookback, and leave the
     unfinished tail to the separate recording-age thresholds. No prior segment
     means unknown earlier coverage, not proof of an earlier recording gap.
     """
-    cutoff = now - 900
+    cutoff = now - lookback
     previous_end: float | None = None
     gaps: list[tuple[float, float]] = []
     normalized = sorted((finite(start), finite(end)) for start, end in intervals)
@@ -137,7 +159,7 @@ def recording_gaps(intervals: list[list[float]], now: float) -> list[tuple[float
             raise ValueError('Invalid recording interval')
         if previous_end is not None:
             gap_start = max(previous_end, cutoff)
-            if start - gap_start >= 30:
+            if start - gap_start >= minimum_gap:
                 gaps.append((gap_start, start))
         previous_end = max(previous_end if previous_end is not None else end, end)
     return gaps
@@ -155,6 +177,10 @@ def evaluate_camera(data: dict[str, Any], uptime: float,
         return 0, f'startup grace ({uptime:.0f}/300 seconds)'
     now = finite(data['now'])
     gaps = recording_gaps(data['recording_intervals'], now)
+    hourly_gaps = recording_gaps(data['recording_intervals'], now, 3600)
+    hourly_loss = sum(stop-start for start,stop in
+                      recording_gaps(data['recording_intervals'], now, 3600, 5))
+    budget_exceeded = len(hourly_gaps) >= 3 or hourly_loss >= 180
     missing = int(data['missing_recent_files'])
     if missing < 0:
         raise ValueError('Invalid missing file count')
@@ -163,17 +189,24 @@ def evaluate_camera(data: dict[str, Any], uptime: float,
     code = 0
     if age is None or not data['file_exists'] or missing or age > critical:
         code = 2
-    elif age > warning or gaps:
+    elif age > warning or budget_exceeded:
         code = 1
     quality_code, quality_text, bad, sampled = evaluate_quality(data.get('quality', []), now)
     audio_code, audio_text, audio_bad, audio_sampled = (0, 'audio_not_required', 0, 0)
+    timing_code, timing_text, timing_bad, timing_sampled = (0, 'av_timing_not_required', 0, 0)
     if data.get('audio_expected', False):
         audio_code, audio_text, audio_bad, audio_sampled = evaluate_quality(data.get('audio_quality', []), now)
         audio_text = audio_text.replace('quality_bad=', 'audio_bad=')
+        timing_code, timing_text, timing_bad, timing_sampled = evaluate_quality(data.get('timing_quality', []), now)
+        timing_text = timing_text.replace('quality_bad=', 'av_timing_bad=')
     # A definite recording failure outranks a diagnostic timeout (UNKNOWN).
-    codes = (code, quality_code, audio_code)
+    codes = (code, quality_code, audio_code, timing_code)
     known_code = max(value for value in codes if value != 3)
     code = known_code if known_code else 3 if 3 in codes else 0
+    # One incident level avoids WARNING/CRITICAL oscillation emails for the
+    # same camera fault. UNKNOWN stays distinct from proven recording loss.
+    if code == 1:
+        code = 2
     age_text = 'no saved file' if age is None or not data['file_exists'] else f'{age:.0f}s'
     perf_age = 'U' if age is None else f'{age:.1f}s'
     gap_text = 'none'
@@ -185,12 +218,16 @@ def evaluate_camera(data: dict[str, Any], uptime: float,
             f' ({stop - start:.0f}s)' for start, stop in gaps
         )
     return code, (f'recording_age={age_text}; recovered_gaps_15m={len(gaps)} [{gap_text}];'
-                  f' missing_recent_files={missing}; {quality_text}; {audio_text}'
+                  f' significant_gaps_1h={len(hourly_gaps)}; loss_seconds_1h={hourly_loss:.0f};'
+                  f' missing_recent_files={missing}; {quality_text}; {audio_text}; {timing_text}'
                   f' | recording_age={perf_age};{warning};{critical};0'
-                  f' recovered_gaps_15m={len(gaps)};0;;0'
+                  f' recovered_gaps_15m={len(gaps)};;;0'
+                  f' significant_gaps_1h={len(hourly_gaps)};3;;0'
+                  f' loss_seconds_1h={hourly_loss:.1f}s;180;;0'
                   f' missing_recent_files={missing};0;0;0'
                   f' quality_bad={bad};2;3;0;{sampled} quality_samples={sampled};;;0;3'
-                  f' audio_bad={audio_bad};2;3;0;{audio_sampled} audio_samples={audio_sampled};;;0;3')
+                  f' audio_bad={audio_bad};2;3;0;{audio_sampled} audio_samples={audio_sampled};;;0;3'
+                  f' av_timing_bad={timing_bad};2;3;0;{timing_sampled}')
 
 
 def evaluate_quality(samples: list[dict[str, Any]], now: float) -> tuple[int, str, int, int]:

@@ -33,7 +33,7 @@ class FrigateChecks(unittest.TestCase):
         self.assertEqual(code,2)
         self.assertIn('quality_bad=3/3',text)
         self.camera['quality'][0]['status']='ok'
-        self.assertEqual(check.evaluate_camera(self.camera,600,120,300)[0],1)
+        self.assertEqual(check.evaluate_camera(self.camera,600,120,300)[0],2)
         self.camera['quality']=[{'end':990,'status':'timeout'}]
         self.camera['recording_end']=0
         self.assertEqual(check.evaluate_camera(self.camera,600,120,300)[0],2)
@@ -46,7 +46,7 @@ class FrigateChecks(unittest.TestCase):
         self.camera = {'camera_config': {'enabled': True, 'record_enabled': True}, 'stats': {'camera_fps': 5, 'process_fps': 5}, 'recording_end': 980, 'now': 1000, 'file_exists': True, 'recording_intervals': [[900, 980]], 'missing_recent_files': 0}
 
     def test_camera_states(self):
-        for age, expected in ((20, 0), (120, 0), (121, 1), (300, 1), (301, 2)):
+        for age, expected in ((20, 0), (120, 0), (121, 2), (300, 2), (301, 2)):
             with self.subTest(age=age):
                 self.camera['recording_end'] = 1000 - age
                 self.assertEqual(check.evaluate_camera(self.camera, 600, 120, 300)[0], expected)
@@ -58,10 +58,10 @@ class FrigateChecks(unittest.TestCase):
         del self.camera['stats']
         self.assertEqual(check.evaluate_camera(self.camera, 600, 120, 300)[0], 0)
 
-    def test_recovered_gap_remains_warning_then_expires(self):
+    def test_single_recovered_gap_is_informational_then_expires(self):
         self.camera['recording_intervals'] = [[800, 850], [900, 980]]
         code, text = check.evaluate_camera(self.camera, 600, 120, 300)
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 0)
         self.assertIn('(50s)', text)
         self.assertIn('1970-01-01T00:14:10+00:00', text)
         self.camera.update(now=1801, recording_end=1800,
@@ -127,6 +127,42 @@ class FrigateChecks(unittest.TestCase):
             check.evaluate_camera(self.camera, 600, 120, 300)
 
 
+class AlertPolicyTests(unittest.TestCase):
+    def test_hourly_gap_count_and_loss_budgets(self):
+        data = dict(camera_config=dict(enabled=True, record_enabled=True), now=4000,
+                    recording_end=3990, file_exists=True, missing_recent_files=0,
+                    recording_intervals=[[1000,1100],[1130,2000],[2030,3000],[3030,3990]])
+        self.assertEqual(check.evaluate_camera(data,600,120,300)[0],2)
+        data['recording_intervals']=[[1000,1100],[1279,3990]]
+        self.assertEqual(check.evaluate_camera(data,600,120,300)[0],0)
+        data['recording_intervals']=[[1000,1100],[1280,3990]]
+        self.assertEqual(check.evaluate_camera(data,600,120,300)[0],2)
+        data['recording_intervals']=[[0,100],[1000,3990]]
+        self.assertEqual(check.evaluate_camera(data,600,120,300)[0],2)
+        data.update(now=8000,recording_end=7990,recording_intervals=[[0,100],[1000,7990]])
+        self.assertEqual(check.evaluate_camera(data,600,120,300)[0],0)
+
+    def test_timing_fault_is_not_audio_corruption(self):
+        namespace={}
+        exec(check.AUDIO_CLASSIFIER+check.AUDIO_DETAILS,namespace)
+        classify=namespace['audio_details']
+        self.assertEqual(classify([dict(codec_type='video',start_time='0',duration='5.1'),
+                                   dict(codec_type='audio',start_time='0.045',duration='15.9')]),('ok','bad'))
+        self.assertEqual(classify([dict(codec_type='video',start_time='0',duration='10'),
+                                   dict(codec_type='audio',start_time='0',duration='0.021')]),('bad','ok'))
+        self.assertEqual(classify([dict(codec_type='video',start_time='0',duration='10'),
+                                   dict(codec_type='audio',start_time='43893',duration='10')]),('ok','bad'))
+
+    def test_sustained_timing_fault_still_alerts(self):
+        data=dict(camera_config=dict(enabled=True,record_enabled=True),now=1000,
+                  recording_end=990,file_exists=True,missing_recent_files=0,
+                  recording_intervals=[[900,990]],audio_expected=True,
+                  timing_quality=[dict(end=990-i*30,status='bad') for i in range(3)])
+        code,message=check.evaluate_camera(data,600,120,300)
+        self.assertEqual(code,2)
+        self.assertIn('av_timing_bad=3/3',message)
+
+
 class AudioClassifierTests(unittest.TestCase):
     def setUp(self):
         namespace = {}
@@ -166,7 +202,7 @@ class AudioClassifierTests(unittest.TestCase):
         data = dict(camera_config=dict(enabled=True, record_enabled=True), now=1000,
                     recording_end=990, file_exists=True, recording_intervals=[[900,990]],
                     missing_recent_files=0, quality=[], audio_expected=True)
-        for statuses, expected in ((['bad','bad','bad'],2), (['bad','bad','ok'],1),
+        for statuses, expected in ((['bad','bad','bad'],2), (['bad','bad','ok'],2),
                                    (['ok','ok','ok'],0), (['timeout','ok','ok'],3)):
             data['audio_quality'] = [dict(end=990-i*30, status=s) for i,s in enumerate(statuses)]
             code, message = check.evaluate_camera(data, 600, 120, 300)
