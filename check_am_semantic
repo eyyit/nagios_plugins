@@ -1,0 +1,10 @@
+#!/bin/sh
+
+timeout 35s docker exec ai-memory-worker \
+  python /scripts/check-memory.py semantic
+status=$?
+case $status in
+  0|1|2|3) exit "$status" ;;
+  *) echo 'AI MEMORY CRITICAL: probe timeout or execution failure'
+    exit 2 ;;
+esac

@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /usr/bin/python3 /opt/repos/docker/prometheus/monitoring/check_collection.py "$@"
